@@ -1,7 +1,7 @@
 name: nanb_chat
 description: "NANb Chat — privacy-focused secure messenger (mobile client)."
 publish_to: 'none'
-version: 1.0.0+47
+version: 1.0.0+48
 
 environment:
   sdk: ^3.11.5
@@ -58,6 +58,7 @@ dependencies:
   # browser from Settings → About. The App Store and Play both want a reachable
   # privacy-policy URL; this also surfaces it in-app.
   url_launcher: ^6.3.1
+  package_info_plus: ^8.3.0
   # Browser APIs (IndexedDB, WebCrypto) for the web client's platform layer.
   web: ^1.1.0
 

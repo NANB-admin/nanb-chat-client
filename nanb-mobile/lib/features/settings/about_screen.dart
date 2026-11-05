@@ -1,23 +1,24 @@
 import 'package:flutter/material.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../app/design_tokens.dart';
 import '../../app/theme.dart';
+import 'open_source_notices.dart';
 import 'widgets/settings_scaffold.dart';
 
-/// Static "about" screen — version, license, links. Hardcoded for v1; if the
-/// app needs to read live build info later, swap in `package_info_plus`.
+/// "About" screen — version (read from the installed build), license, links.
 class AboutScreen extends StatelessWidget {
   const AboutScreen({super.key});
-
-  static const _appVersion = 'v0.2.0';
-  static const _serverVersion = 'v0.3';
 
   // Hosted legal pages (Google Sites, custom domain). Linked here so the
   // privacy policy is reachable in-app; the same URLs go in the store listings.
   static const _privacyUrl = 'https://www.nanb.us/privacy/nanb-chat-privacy';
   static const _deletionUrl =
       'https://www.nanb.us/terms-of-service/nanb-chat-deletion-policy';
+
+  // Public source for the app (GPL-3.0 requires it to be available to users).
+  static const _sourceUrl = 'https://github.com/NANB-admin/nanb-chat-client';
 
   @override
   Widget build(BuildContext context) {
@@ -49,8 +50,17 @@ class AboutScreen extends StatelessWidget {
           const SettingsSectionHeader(label: 'Build'),
           SettingsCard(
             children: [
-              _Row(t: t, label: 'App version', value: _appVersion),
-              _Row(t: t, label: 'Server version', value: _serverVersion),
+              FutureBuilder<PackageInfo>(
+                future: PackageInfo.fromPlatform(),
+                builder: (context, snap) {
+                  final info = snap.data;
+                  return _Row(
+                    t: t,
+                    label: 'App version',
+                    value: info == null ? '' : 'v${info.version} (${info.buildNumber})',
+                  );
+                },
+              ),
               _Row(t: t, label: 'Domain', value: 'nanb.link', last: true),
             ],
           ),
@@ -60,6 +70,25 @@ class AboutScreen extends StatelessWidget {
               _Row(t: t, label: 'Identity', value: 'Ed25519'),
               _Row(t: t, label: 'Group messages', value: 'MLS · RFC 9420'),
               _Row(t: t, label: 'Storage', value: 'SQLCipher', last: true),
+            ],
+          ),
+          const SettingsSectionHeader(label: 'Open source'),
+          SettingsCard(
+            children: [
+              _Row(t: t, label: 'License', value: 'GPL-3.0'),
+              _LinkRow(t: t, label: 'Source code', url: _sourceUrl),
+              _TapRow(
+                t: t,
+                label: 'Open-source licenses',
+                last: true,
+                onTap: () {
+                  registerOpenSourceNotices();
+                  showLicensePage(
+                    context: context,
+                    applicationName: 'NANb Chat',
+                  );
+                },
+              ),
             ],
           ),
           const SettingsSectionHeader(label: 'Legal'),
@@ -127,6 +156,34 @@ class _LinkRow extends StatelessWidget {
           children: [
             Expanded(child: Text(label, style: TextStyle(fontSize: 14, color: t.text))),
             Icon(Icons.open_in_new, size: 16, color: t.textMuted),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Tappable row that runs [onTap]. Same look as [_LinkRow], for in-app targets.
+class _TapRow extends StatelessWidget {
+  const _TapRow({required this.t, required this.label, required this.onTap, this.last = false});
+  final DesignTokens t;
+  final String label;
+  final VoidCallback onTap;
+  final bool last;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+        decoration: BoxDecoration(
+          border: last ? null : Border(bottom: BorderSide(color: t.border)),
+        ),
+        child: Row(
+          children: [
+            Expanded(child: Text(label, style: TextStyle(fontSize: 14, color: t.text))),
+            Icon(Icons.chevron_right, size: 18, color: t.textMuted),
           ],
         ),
       ),

@@ -1,0 +1,6 @@
+# Wire CoreCrypto XCFrameworks land here at CI time (fetched by
+# .github/workflows/ios.yml from the wireapp/core-crypto v9.3.4 release):
+#   WireCoreCrypto.xcframework/
+#   WireCoreCryptoUniffi.xcframework/
+# They are NOT committed (large binaries); this .gitkeep keeps the dir in tree,
+# mirroring ios/NanbArti/lib/.gitkeep.

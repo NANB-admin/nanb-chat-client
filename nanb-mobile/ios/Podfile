@@ -1,0 +1,128 @@
+# Define a global platform for your project. Pinned to iOS 15 (the iPhone 14 test
+# device runs iOS 18; Firebase/WebRTC/Arti/etc. all support 15).
+platform :ios, '15.0'
+
+# CocoaPods analytics sends network stats synchronously affecting flutter build latency.
+ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+project 'Runner', {
+  'Debug' => :debug,
+  'Profile' => :release,
+  'Release' => :release,
+}
+
+def flutter_root
+  generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
+  unless File.exist?(generated_xcode_build_settings_path)
+    raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure flutter pub get is executed first"
+  end
+
+  File.foreach(generated_xcode_build_settings_path) do |line|
+    matches = line.match(/FLUTTER_ROOT\=(.*)/)
+    return matches[1].strip if matches
+  end
+  raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Generated.xcconfig, then run flutter pub get"
+end
+
+require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+
+flutter_ios_podfile_setup
+
+target 'Runner' do
+  use_frameworks!
+
+  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+
+  # Embedded Tor engine = Arti (pure-Rust Tor) staticlib, vendored via the local
+  # NanbArti podspec, driving ios/Runner/TorChannel.swift. Replaced the previous
+  # iCepa C-tor `pod 'Tor'` (which couldn't be restarted in-process after an iOS
+  # suspend → unrecoverable "Reconnecting via Tor" hang). The libnanb_arti.a it
+  # vendors is built by .github/workflows/arti-ios.yml and fetched into
+  # NanbArti/lib/ by ios.yml before the build.
+  pod 'NanbArti', :path => 'NanbArti'
+
+  # Wire's CoreCrypto (MLS) — the iOS counterpart to Android's prebuilt
+  # `com.wire:core-crypto-android:9.3.4` AAR. Wire does NOT publish a CocoaPod;
+  # v9.3.4 ships two prebuilt XCFrameworks as GitHub release assets
+  # (WireCoreCrypto.xcframework + WireCoreCryptoUniffi.xcframework). We vendor them
+  # via a local podspec (same prebuilt-artifact pattern as NanbArti above): the
+  # frameworks are fetched from the wireapp/core-crypto v9.3.4 release into
+  # NanbCoreCrypto/frameworks/ by .github/workflows/ios.yml, then `import
+  # WireCoreCrypto` drives ios/Runner/NanbCryptoChannel.swift. Keep the version
+  # matched to the Android AAR major (9.3.x) or the UniFFI signatures drift.
+  pod 'NanbCoreCrypto', :path => 'NanbCoreCrypto'
+
+  target 'RunnerTests' do
+    inherit! :search_paths
+  end
+end
+
+# `permission_handler_apple` compiles a strategy for EVERY iOS permission it
+# supports, whether the app asks for it or not. This trims that down to the two
+# the app actually requests on iOS — `Permission.camera` and
+# `Permission.microphone` (`chat_thread_screen`, `voice_recorder_controller`);
+# `systemAlertWindow` is Android-only, and photos go through image_picker / gal,
+# which carry their own purpose strings. Anything NOT listed below stays compiled
+# in, so this is an inverted allow-list: if a future feature calls
+# `Permission.<x>` on iOS, DELETE its line or the request reports the permission
+# as unavailable at runtime.
+#
+# ⚠️ INERT AS LONG AS SWIFT PACKAGE MANAGER IS ON. This project builds through
+# BOTH systems ("Adding Swift Package Manager integration…" then "Running pod
+# install…" in the iOS CI logs). permission_handler_apple ships a `Package.swift`
+# that supports SPM, so it is built there and never reads this Podfile — it
+# derives the same macros itself, defaulting each to 0 unless the matching
+# Info.plist key exists. The settings here only take effect if this project ever
+# falls back to CocoaPods for it; they are kept so that fallback lands on the
+# same allow-list rather than the plugin's compile-everything default.
+#
+# NOT the fix for ITMS-90683 (missing NSLocationWhenInUseUsageDescription) — that
+# was a wrong first guess. The CoreLocation symbols in the Runner binary come
+# from `file_picker` → DKImagePickerController → **DKCamera**
+# (`DKCameraLocationManager`), verified by disassembling the shipped IPA; under
+# SPM permission_handler's location strategy was ALREADY compiled out. The real
+# fix is the purpose string now in `Runner/Info.plist`. Side effect worth knowing:
+# that key makes permission_handler's SPM manifest switch PERMISSION_LOCATION back
+# ON, which is harmless — nothing in this app calls `Permission.location`.
+PERMISSION_HANDLER_DISABLED_MACROS = [
+  'PERMISSION_EVENTS=0',
+  'PERMISSION_EVENTS_FULL_ACCESS=0',
+  'PERMISSION_REMINDERS=0',
+  'PERMISSION_CONTACTS=0',
+  'PERMISSION_SPEECH_RECOGNIZER=0',
+  'PERMISSION_PHOTOS=0',
+  'PERMISSION_PHOTOS_ADD_ONLY=0',
+  'PERMISSION_LOCATION=0',
+  'PERMISSION_LOCATION_ALWAYS=0',
+  'PERMISSION_LOCATION_WHENINUSE=0',
+  'PERMISSION_NOTIFICATIONS=0',
+  'PERMISSION_MEDIA_LIBRARY=0',
+  'PERMISSION_SENSORS=0',
+  'PERMISSION_BLUETOOTH=0',
+  'PERMISSION_APP_TRACKING_TRANSPARENCY=0',
+  'PERMISSION_CRITICAL_ALERTS=0',
+  'PERMISSION_ASSISTANT=0',
+].freeze
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    flutter_additional_ios_build_settings(target)
+    # Pin every pod target to the app's iOS 15 floor so CocoaPods doesn't leave
+    # one below the deployment target and fail the build.
+    target.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
+
+      next unless target.name == 'permission_handler_apple'
+
+      # APPEND rather than the `||=` the permission_handler README suggests:
+      # flutter_additional_ios_build_settings above may already have populated
+      # this key, and `||=` would then drop every macro on the floor — silently,
+      # with the ITMS-90683 warning only reappearing at the next upload.
+      existing = config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] ||
+                 ['$(inherited)']
+      existing = [existing] unless existing.is_a?(Array)
+      config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] =
+        existing + PERMISSION_HANDLER_DISABLED_MACROS
+    end
+  end
+end

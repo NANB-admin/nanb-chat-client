@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- APNs environment. "production" is what TestFlight/App Store distribution
+	     requires: the App Store provisioning profile authorises it and a
+	     distribution build registers a PRODUCTION APNs token (Firebase already
+	     holds the production APNs auth key 72K75C8PKJ).
+	     Sideloaded dev builds are unaffected — zsign re-signs them with the
+	     development provisioning profile, whose entitlements re-stamp
+	     aps-environment back to "development" (sandbox) regardless of the value
+	     committed here. -->
+	<key>aps-environment</key>
+	<string>production</string>
+	<!-- Shared App Group: the app mirrors the values the Notification Service
+	     Extension needs (identity/X25519 keys, peer-seal-keys) into this group's
+	     container so the extension can send the closed-app sealed "delivered"
+	     receipt. Unlike keychain-access-groups (whose dev-profile entitlement is
+	     a team wildcard the signer can't make concrete per target), the App Group
+	     entitlement is concrete in the provisioning profile, so zsign embeds it
+	     correctly. Must match the NSE's entitlement + SharedStoreChannel. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.us.nanb.chat</string>
+	</array>
+</dict>
+</plist>

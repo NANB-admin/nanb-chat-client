@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Shared App Group: the ONLY channel between this extension and the app.
+	     The extension writes the shared text + copied files here; the app reads
+	     and clears them (IncomingShareChannel). Must match the Runner target's
+	     com.apple.security.application-groups and SharedInbox.appGroup.
+	     Like the Notification Service Extension, this needs no other
+	     entitlement — it never registers for push and never talks to the network. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.us.nanb.chat</string>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,65 @@
+group = "us.nanb.crypto"
+version = "1.0.0"
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        // Mirror the host app's versions (android/settings.gradle.kts).
+        // Kotlin comes from Flutter's built-in Kotlin — no KGP classpath
+        // (applying it is deprecated and will fail future Flutter builds).
+        classpath("com.android.tools.build:gradle:8.11.1")
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: "com.android.library"
+
+android {
+    namespace = "us.nanb.crypto"
+    compileSdk = 35
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        // CoreCrypto AAR (com.wire:core-crypto-android:9.3.4) declares
+        // minSdkVersion 26 — see Plan A's Maven-AAR pivot note.
+        minSdk = 26
+
+        // JNA/CoreCrypto keep rules for the HOST app's R8 pass — without
+        // them a minified release build strips JNA's reflection surface
+        // ("Can't obtain peer field ID for class com.sun.jna.Pointer").
+        consumerProguardFiles "consumer-rules.pro"
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+dependencies {
+    // Wire CoreCrypto — prebuilt AAR with libcore_crypto_ffi.so for all
+    // 4 Android ABIs + UniFFI-generated Kotlin bindings under com.wire.crypto.
+    // Pinned to v9.3.4 per Plan A; bump as a separate maintenance plan.
+    implementation("com.wire:core-crypto-android:9.3.4")
+
+    // Embedded Tor is now Arti (pure-Rust Tor) via the nanb-arti-ffi JNI bridge:
+    // libnanb_arti.so is cross-compiled by .github/workflows/android-arti.yml and
+    // bundled into the app's jniLibs (loaded with System.loadLibrary — no Gradle
+    // dep). This REPLACED Guardian Project C-tor (info.guardianproject:tor-android
+    // + jtorctl + a foreground TorService) so iOS and Android share ONE Tor engine.
+    // See docs/embedded-tor-design.md §13.
+}

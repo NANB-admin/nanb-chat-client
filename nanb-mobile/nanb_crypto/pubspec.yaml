@@ -1,0 +1,25 @@
+name: nanb_crypto
+description: >-
+  Native CoreCrypto MLS channel for NANb Chat. Packaged as a local plugin
+  (not a manual MainActivity registration) so GeneratedPluginRegistrant
+  attaches it to every FlutterEngine — including the FCM background
+  isolate's engine, which never passes through MainActivity.
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.9.0
+  flutter: ">=3.35.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: us.nanb.crypto
+        pluginClass: NanbCryptoPlugin
+      # iOS intentionally absent: the (still-stubbed) Swift shim registers
+      # in AppDelegate; move it here when real iOS MLS lands.

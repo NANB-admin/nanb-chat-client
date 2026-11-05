@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Shared App Group: lets the extension read the values the app mirrored
+	     (identity/X25519 keys, peer-seal-keys) into the group container to build
+	     the closed-app sealed "delivered" receipt. Must match the Runner target's
+	     com.apple.security.application-groups + SharedStoreChannel/NseSharedStore.
+	     The extension needs NO aps-environment (it doesn't register for push). -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.us.nanb.chat</string>
+	</array>
+</dict>
+</plist>

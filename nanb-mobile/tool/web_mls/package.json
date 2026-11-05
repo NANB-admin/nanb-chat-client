@@ -1,0 +1,17 @@
+{
+  "name": "nanb-web-mls",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser MLS bridge (Wire CoreCrypto WASM) for the NANb Flutter web client",
+  "license": "GPL-3.0",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@wireapp/core-crypto": "9.3.4"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

@@ -1,0 +1,212 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false"/>
+
+    <!-- image_picker: Android 13+ uses the scoped photo picker, which needs no
+         permission (so READ_MEDIA_IMAGES is deliberately NOT requested: it
+         would force a Play "photo and video permissions" declaration a
+         messenger can't truthfully make). Older devices (<=32) read via the
+         legacy gallery permission below. The open_filex plugin also merges in
+         READ_MEDIA_IMAGES/VIDEO/AUDIO; the app only opens its own app-private
+         copies of attachments, so those are stripped from the final manifest. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" tools:node="remove"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" tools:node="remove"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" tools:node="remove"/>
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <!-- WebRTC audio routing (earpiece/speaker/Bluetooth) for voice calls. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+    <!-- Voice-call ringing: a full-screen incoming-call notification + a
+         foreground service that keeps the call alive. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+    <!-- "Display over other apps": lets the native IncomingCallActivity launch
+         as a full-screen ring even when the device is UNLOCKED and the app is
+         backgrounded. A full-screen intent only auto-launches when the screen is
+         locked/off; while the device is in use Android demotes it to a heads-up
+         banner, so without this the ring screen never appears (and, since the
+         ringtone plays inside the activity, it's silent). With this granted the
+         call push can start the ring activity directly. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+
+    <!-- gal: saving received media to the gallery. Android 10+ (API 29+) writes
+         via MediaStore and needs no permission; only API ≤28 needs the legacy
+         write permission, so it's capped with maxSdkVersion. -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"/>
+    <!-- Defense-in-depth: exclude app data (SQLCipher DB, secure-storage prefs)
+         from cloud/adb backups. The DB is already encrypted, but its data + the
+         OS-keystore-wrapped keys shouldn't be copied off-device via backup. -->
+    <application
+        android:label="Chat"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. -->
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+
+            <!-- OS SHARE SHEET. These filters are what put "Chat" in the list of
+                 apps another app offers when the user taps Share (a YouTube
+                 link, a photo from the gallery, a PDF from a file manager).
+                 The intent is captured in onCreate/onNewIntent and collected by
+                 Dart, which opens the "Share to…" conversation picker.
+
+                 The types are enumerated rather than declared as */* on purpose:
+                 we claim the families we can actually send (text, image, video,
+                 audio, documents/archives via application/*) instead of
+                 advertising ourselves as a target for content we'd have to
+                 reject.
+
+                 The filters live on MainActivity (not a trampoline activity) so
+                 the sender's read grant on a `content://` stream stays valid
+                 until THIS task finishes — long enough for the copy that
+                 happens when Dart collects the share. A trampoline that
+                 finished immediately could have its grant revoked first.
+
+                 WHY THE ACTIVITY IS `singleTask` (was singleTop): with the
+                 stock Flutter template's `taskAffinity=""` (anti-task-hijacking)
+                 a share intent finds NO task to reuse, so the share sheet
+                 started a SECOND MainActivity in a new task — a second
+                 FlutterEngine in one process, i.e. two ConversationsNotifiers
+                 on one SQLCipher database and one MLS store. Measured on a
+                 Pixel 10: two live MainActivity records after sharing a photo,
+                 and the share screen never appeared. `singleTask` keeps at most
+                 one instance system-wide and routes the share to onNewIntent on
+                 the existing one, without giving up the empty affinity. Safe
+                 here because the app is single-Activity (all navigation is in
+                 Dart) and the over-lock ring is its own `singleInstance` task. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="text/plain"/>
+                <data android:mimeType="image/*"/>
+                <data android:mimeType="video/*"/>
+                <data android:mimeType="audio/*"/>
+                <data android:mimeType="application/*"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="image/*"/>
+                <data android:mimeType="video/*"/>
+                <data android:mimeType="audio/*"/>
+                <data android:mimeType="application/*"/>
+            </intent-filter>
+        </activity>
+
+        <!-- Native (non-Flutter) full-screen incoming-call screen. STATIC
+             showWhenLocked + turnScreenOn (read before the window is added) make
+             the keyguard treat it as a legitimate over-lock owner, so the ring
+             PERSISTS over a secure lock. Its own task (singleInstance), kept out
+             of recents. Launched directly by the call notification's full-screen
+             intent (posted natively, BAL-exempt). -->
+        <activity
+            android:name=".IncomingCallActivity"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true" />
+
+        <!-- Keeps the process alive for the live span of a call so an audio call
+             (or a minimized video call) survives a screen lock / app-switch.
+             `microphone` type: audio is in every call and RECORD_AUDIO is granted
+             by the time a call is live; it does NOT claim `camera` (a locked-screen
+             video call has no reason to keep capturing). Started/stopped from Dart
+             via MainActivity's nanb.app/call_foreground channel. -->
+        <service
+            android:name=".CallForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+        <!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+
+        <!-- PRIVACY: Firebase/FCM auto-init is OFF by default so a fresh launch
+             contacts Google NOT AT ALL. Without these, the FirebaseInitProvider
+             + FCM auto-init register the device with Google (real IP + token,
+             NOT over Tor) at process start, before Dart main() runs — bypassing
+             the in-app "Google push (FCM)" privacy toggle entirely. The app
+             re-enables both programmatically only when that toggle is on (see
+             main() + AppPreferences.pushOverFcmEnabled). -->
+        <meta-data
+            android:name="firebase_messaging_auto_init_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="firebase_data_collection_default_enabled"
+            android:value="false" />
+
+        <!-- Firebase Cloud Messaging: dispatches wakeup pushes to the Dart
+             background isolate. The service tag is required even when
+             FirebaseMessaging.onBackgroundMessage is registered in Dart. -->
+        <service
+            android:name="com.google.firebase.messaging.FirebaseMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT"/>
+            </intent-filter>
+        </service>
+
+        <!-- Default notification channel id used by flutter_local_notifications.
+             Matches the LocalNotificationsImpl channel constructed in Task 8. -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="nanb-messages"/>
+        <!-- Small icon for any notification the FCM SDK shows directly (vs the
+             local notifications we build): the monochrome NANb mark, not the
+             launcher icon (which silhouettes to a blob). -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@drawable/ic_stat_nanb"/>
+    </application>
+    <!-- Required to query activities that can process text, see:
+         https://developer.android.com/training/package-visibility and
+         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
+
+         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- url_launcher: lets the app resolve a browser to open the hosted
+             legal pages (https) from Settings → About on Android 11+. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="https"/>
+        </intent>
+    </queries>
+</manifest>

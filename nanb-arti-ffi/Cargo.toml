@@ -1,0 +1,54 @@
+[package]
+name = "nanb-arti-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C-ABI bridge exposing an embedded Arti (Rust Tor) client to the iOS app."
+
+[lib]
+name = "nanb_arti"
+# staticlib → libnanb_arti.a (object archive, no link step) that Xcode links into
+# the iOS Runner. cdylib → libnanb_arti.so for Android (loaded via JNI / System
+# .loadLibrary). The iOS build uses the .a and ignores the .so; the Android build
+# (cargo-ndk) uses the .so.
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# Arti (pure-Rust Tor). rustls (not the default native-tls) is far more
+# static-link-friendly for an iOS staticlib, so default-features=false then
+# re-add tokio + rustls. onion-service-client = v3 .onion client support (the
+# server is a .onion). static-sqlite statically links the dirmgr's SQLite.
+arti-client = { version = "0.43", default-features = false, features = [
+    "tokio",
+    "rustls",
+    "onion-service-client",
+    "static-sqlite",
+] }
+# We construct the TorClient against the current Tokio runtime via
+# tor_rtcompat::PreferredRuntime, so depend on it directly with matching TLS.
+tor-rtcompat = { version = "0.43", default-features = false, features = ["tokio", "rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+futures = "0.3"
+anyhow = "1"
+# rustls 0.23 requires a process-default CryptoProvider to be installed before
+# first use (else it panics). Arti's rustls relies on the process default, so we
+# install ring's provider at startup. Unified with arti's rustls (same version).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Pinned: no Cargo.lock is committed, so CI resolves the newest crates, and
+# with a libc newer than 0.2.187 the iOS staticlib stops compiling: sysinfo
+# 0.38.4's apple backend (pulled in by arti) can't find proc_pidinfo /
+# proc_fdinfo for aarch64-apple-ios. 0.2.187 is what the last green build
+# (2026-07-21) resolved.
+# Lift once sysinfo/arti catch up (or commit a Cargo.lock instead).
+libc = "=0.2.187"
+
+# Android-only: the JNI bridge (Java_us_nanb_crypto_ArtiNative_*). iOS uses the C
+# ABI instead, so jni isn't pulled into the iOS staticlib.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[profile.release]
+# Favour a smaller IPA without making the (large) Arti tree build pathologically
+# slow: size-opt + strip, but no full LTO / single-codegen-unit.
+opt-level = "s"
+strip = true

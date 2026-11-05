@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Native incoming-call (ring) screen shown over the lock by IncomingCallActivity.
+     Deliberately native (no Flutter engine) so it persists over a secure lock. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center_horizontal"
+    android:background="#0E1116"
+    android:fitsSystemWindows="true">
+
+    <View
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_weight="1.4" />
+
+    <TextView
+        android:id="@+id/call_avatar"
+        android:layout_width="120dp"
+        android:layout_height="120dp"
+        android:gravity="center"
+        android:textSize="40sp"
+        android:textColor="#E8EAED"
+        android:textStyle="bold"
+        android:fontFamily="monospace"
+        android:background="@drawable/call_avatar_bg"
+        android:text="?" />
+
+    <TextView
+        android:id="@+id/call_name"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:textSize="22sp"
+        android:textColor="#E8EAED"
+        android:fontFamily="monospace"
+        android:text="Unknown" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:textSize="14sp"
+        android:textColor="#9AA0A6"
+        android:letterSpacing="0.05"
+        android:fontFamily="monospace"
+        android:text="Incoming call" />
+
+    <View
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_weight="2" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginBottom="56dp"
+        android:weightSum="2"
+        android:baselineAligned="false">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center">
+
+            <ImageButton
+                android:id="@+id/btn_decline"
+                android:layout_width="72dp"
+                android:layout_height="72dp"
+                android:background="@drawable/call_btn_decline"
+                android:scaleType="centerInside"
+                android:src="@android:drawable/sym_action_call"
+                android:tint="#FFFFFF"
+                android:contentDescription="Decline" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:textSize="12sp"
+                android:textColor="#9AA0A6"
+                android:fontFamily="monospace"
+                android:text="Decline" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center">
+
+            <ImageButton
+                android:id="@+id/btn_accept"
+                android:layout_width="72dp"
+                android:layout_height="72dp"
+                android:background="@drawable/call_btn_accept"
+                android:scaleType="centerInside"
+                android:src="@android:drawable/sym_action_call"
+                android:tint="#FFFFFF"
+                android:contentDescription="Accept" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:textSize="12sp"
+                android:textColor="#9AA0A6"
+                android:fontFamily="monospace"
+                android:text="Accept" />
+        </LinearLayout>
+    </LinearLayout>
+</LinearLayout>

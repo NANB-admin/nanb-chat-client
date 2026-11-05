@@ -1,0 +1,14 @@
+<!-- Monochrome status-bar notification icon: a chat bubble with a keyhole,
+     matching the Chat app logo (secure messaging). Android renders notification
+     small icons as a flat white silhouette, so this is white-on-transparent and
+     the keyhole is punched out with evenOdd so it stays legible at 24dp. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M20,2H4C2.9,2 2.01,2.9 2.01,4L2,22l4,-4h14c1.1,0 2,-0.9 2,-2V4c0,-1.1 -0.9,-2 -2,-2z M12,6 C10.62,6 9.5,7.12 9.5,8.5 C9.5,9.37 9.95,10.13 10.62,10.57 L10,14 L14,14 L13.38,10.57 C14.05,10.13 14.5,9.37 14.5,8.5 C14.5,7.12 13.38,6 12,6 Z" />
+</vector>

@@ -1,0 +1,144 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Used to scan a QR code from a new device that wants to link to your account.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Used to attach photos to your messages. Photos are encrypted on this device before upload.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Used to save photos and videos you receive in chats to your photo library.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Used to record voice notes you send in chats. Voice recordings are encrypted on this device before upload.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Used to unlock the app when app lock is enabled.</string>
+	<!-- Chat NEVER asks for location and has no location feature. This string is
+	     here only because App Store Connect answered the 1.0.0 (4) upload with
+	     ITMS-90683: the file_picker plugin pulls DKImagePickerController, whose
+	     DKCamera component holds a CLLocationManager (it geotags photos captured
+	     through its own camera UI — a path this app does not use). Apple requires
+	     the purpose string for a DEPENDENCY's dormant API references, not just
+	     for APIs you call: "While your app might not use these APIs, a purpose
+	     string is still required." The prompt this text would appear in is never
+	     triggered. Remove this key if file_picker / DKImagePickerController ever
+	     leaves the dependency tree. -->
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Chat does not collect or use your location. A photo-picker component included with the app can read location when capturing a photo through its own camera; Chat never requests location access.</string>
+	<!-- ITMS-90683 (build 6) still flagged the app AFTER the WhenInUse key above,
+	     because the DKImagePickerController CLLocationManager reference makes
+	     Apple's static scan require the "Always" variant SPECIFICALLY by name.
+	     Same non-triggered dormant-dependency situation — Chat never requests
+	     any location authorization — so the string mirrors the one above. Remove
+	     both if file_picker / DKImagePickerController leaves the dependency tree. -->
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Chat does not collect or use your location. A photo-picker component included with the app can read location when capturing a photo through its own camera; Chat never requests location access.</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Chat</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Chat</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(FLUTTER_BUILD_NAME)</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<!-- Export compliance: the app uses standard (non-proprietary) encryption and
+	     is NOT offered in France, so App Store Connect needs no encryption
+	     declaration/documentation and will never issue an
+	     `ITSEncryptionExportComplianceCode` (the API refuses to create a
+	     declaration for this profile). `ITSAppUsesNonExemptEncryption` is therefore
+	     deliberately ABSENT: `true` with no code fails upload with error 90592, and
+	     `false` would misdeclare the encryption. ASC asks the France question once
+	     per build instead. See ../EXPORT_COMPLIANCE.md (resolved 2026-10-25). -->
+
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<!-- Custom scheme used ONLY by our own share extension to foreground the
+	     app after it has parked a share in the App Group container (see
+	     NanbShareExtension/ShareViewController.swift). The URL is a bare
+	     wake-up signal: it carries NO payload — shared content travels through
+	     the group container, never through a URL that other apps could observe
+	     or forge. Nothing else handles it; the app collects any pending share
+	     on every foreground regardless of how it was brought up, so an
+	     unhandled `nanb://` open is harmless. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>us.nanb.chat.share</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>nanb</string>
+			</array>
+		</dict>
+	</array>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneClassName</key>
+					<string>UIWindowScene</string>
+					<key>UISceneConfigurationName</key>
+					<string>flutter</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+					<key>UISceneStoryboardFile</key>
+					<string>Main</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIMainStoryboardFile</key>
+	<string>Main</string>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<!-- remote-notification: APNs wakeup pushes.
+	     audio: keep the app running while a call's audio is live after the screen
+	     locks / the app backgrounds, so an audio (or minimized video) call isn't
+	     suspended and dropped. WebRTC holds an active AVAudioSession (playAndRecord)
+	     for the call span; iOS keeps the process alive only while that session is
+	     active, and the session ends when the call does. NOTE: this is the `audio`
+	     mode, NOT `voip` — `voip` requires a CallKit + PushKit integration or App
+	     Review rejects it. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+		<string>audio</string>
+		<!-- voip: PushKit delivers the incoming-call ring even when the app is
+		     suspended or has never been launched, which is the ONLY way a locked
+		     iPhone rings for a call (an alert push shows a passive banner and
+		     runs no app code). App Review requires that an app declaring `voip`
+		     integrate CallKit and report EVERY VoIP push to it — see
+		     Runner/CallKitCenter.swift + Runner/VoipPushChannel.swift, which
+		     report unconditionally in didReceiveIncomingPushWith. -->
+		<string>voip</string>
+	</array>
+</dict>
+</plist>

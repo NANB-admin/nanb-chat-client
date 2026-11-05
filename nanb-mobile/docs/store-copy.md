@@ -40,7 +40,7 @@ actually shipped in the build being submitted.
 > that's by design, not a bug. Muted chats can still show a banner on iOS.
 >
 > Feedback on anything that feels slow, drops a message, or fails to connect is
-> especially useful — reach us at admin@nanb.us.
+> especially useful — reach us at contact@nanb.us.
 
 ## What to Test (per-build field)
 

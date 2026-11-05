@@ -51,5 +51,5 @@ license it under GPL-3.0-only. Please sign off your commits (`git commit -s`).
 
 ## Security
 
-Please report vulnerabilities privately to admin@nanb.us rather than opening a
+Please report vulnerabilities privately to contact@nanb.us rather than opening a
 public issue.

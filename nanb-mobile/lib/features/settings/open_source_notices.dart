@@ -33,7 +33,7 @@ void registerOpenSourceNotices() {
     );
     yield const LicenseEntryWithLineBreaks(
       ['Roboto'],
-      'Roboto (c) Google LLC, https://github.com/googlefonts/roboto\n\n'
+      'Roboto Copyright 2011 Google Inc., https://github.com/googlefonts/roboto\n\n'
       'Licensed under the Apache License, Version 2.0.',
     );
     yield const LicenseEntryWithLineBreaks(

@@ -4993,6 +4993,76 @@ void main() {
       expect(notifier.byId(convoId)!.cryptoMode, CryptoMode.mls);
     });
 
+    Future<String> startFirstContactWithSibling(String siblingId) async {
+      await sessions.save(session);
+      await notifier.connect();
+      final peerAcc = Account(
+        accountId: _peerAccountId,
+        username: _peerUsername,
+        identityPubKey: const [9, 8, 7],
+        x25519PubKey: const [1, 2, 3],
+        deviceId: 'peer-dev',
+        devices: const [
+          AccountDevice(deviceId: 'peer-dev', x25519PubKey: [1, 2, 3]),
+        ],
+      );
+      when(() => api.lookupAccount(_peerUsername))
+          .thenAnswer((_) async => peerAcc);
+      when(() => api.listDevices()).thenAnswer((_) async => [
+            const Device(
+                deviceId: _myDeviceId, accountId: 'me-acc', devicePubKey: []),
+            Device(
+                deviceId: siblingId,
+                accountId: 'me-acc',
+                devicePubKey: const [],
+                x25519PubKey: const [7, 7, 7]),
+          ]);
+      when(() => api.lookupDeviceKeyPackages(_peerUsername))
+          .thenAnswer((_) async => const [
+                DeviceKeyPackageResult(deviceId: 'peer-dev', keyPackage: [1]),
+              ]);
+      when(() => api.lookupDeviceKeyPackages('me')).thenAnswer((_) async => [
+            DeviceKeyPackageResult(deviceId: siblingId, keyPackage: const [3]),
+          ]);
+      final convoId = await notifier.startConversation(
+        myDeviceId: _myDeviceId,
+        username: _peerUsername,
+      );
+      await notifier.sendMessage(
+        conversationId: convoId,
+        myDeviceId: _myDeviceId,
+        text: 'hello from a sibling',
+      );
+      await pumpEventQueue();
+      return convoId;
+    }
+
+    test('a sibling device with a smaller id starts the MLS group, not this one',
+        () async {
+      final convoId = await startFirstContactWithSibling('a-dev');
+
+      final sent = verify(() => api.submitMessage(captureAny()))
+          .captured
+          .cast<SubmitMessagePayload>();
+      expect(sent.where((p) => p.envelopeType == EnvelopeType.mlsWelcome),
+          isEmpty);
+      expect(notifier.byId(convoId)!.cryptoMode, CryptoMode.ratchet);
+    });
+
+    test('the smallest-id device starts the MLS group and welcomes its sibling',
+        () async {
+      await startFirstContactWithSibling('z-dev');
+
+      final sent = verify(() => api.submitMessage(captureAny()))
+          .captured
+          .cast<SubmitMessagePayload>();
+      final welcomed = sent
+          .where((p) => p.envelopeType == EnvelopeType.mlsWelcome)
+          .map((p) => p.recipientDeviceId)
+          .toSet();
+      expect(welcomed, containsAll(['peer-dev', 'z-dev']));
+    });
+
     test('a failed Welcome submit excludes that device from the app fan-out',
         () async {
       // Regression: on first contact the migration fanned the Welcome to every

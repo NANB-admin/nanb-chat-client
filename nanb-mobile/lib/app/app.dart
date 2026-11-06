@@ -19,6 +19,7 @@ import '../features/settings/models/app_theme_mode.dart';
 import 'providers.dart';
 import 'router.dart';
 import 'theme.dart';
+import 'web_update_banner.dart';
 
 class NanbApp extends ConsumerStatefulWidget {
   const NanbApp({super.key, this.initialLocation = Routes.welcome});
@@ -390,7 +391,9 @@ class _NanbAppState extends ConsumerState<NanbApp> {
         // locked) but above all routed content, so an incoming/active call
         // appears over whatever the user is doing.
         child: AppLockGate(
-          child: CallOverlay(child: child ?? const SizedBox.shrink()),
+          child: WebUpdateBanner(
+            child: CallOverlay(child: child ?? const SizedBox.shrink()),
+          ),
         ),
       ),
     );

@@ -3865,6 +3865,16 @@ class ConversationsNotifier extends ChangeNotifier
     return recipients;
   }
 
+  /// True when [myDeviceId] is the lexically-smallest of this account's devices
+  /// (or the only one), i.e. the one device allowed to start a 1:1's initial
+  /// MLS migration. Every sibling computes the same answer from the same list.
+  Future<bool> _isDesignatedInitiatorDevice(String myDeviceId) async {
+    final ids = [
+      for (final d in await _myDeviceList()) d.deviceId,
+    ];
+    return ids.every((id) => id.compareTo(myDeviceId) >= 0);
+  }
+
   /// Full multi-device MLS migration for a 1:1: builds a fresh MLS group whose
   /// members are EVERY device of the peer plus this account's own other devices
   /// (self-sync), encrypts [wireBody] once, and fans the Welcome + application
@@ -3890,6 +3900,15 @@ class ConversationsNotifier extends ChangeNotifier
         session.accountId.isNotEmpty &&
         convo.peerAccountId.isNotEmpty &&
         session.accountId.compareTo(convo.peerAccountId) >= 0) {
+      return null;
+    }
+
+    // Sibling devices of this account must not BOTH build the group: each
+    // would Welcome the peer into its own group and fork the chat. Only the
+    // lexically-smallest own device initiates; the others stay on ratchet and
+    // adopt its Welcome (it includes them as members). Forced rebuilds skip
+    // this for the same reason as above.
+    if (!force && !await _isDesignatedInitiatorDevice(session.deviceId)) {
       return null;
     }
 
@@ -4575,6 +4594,14 @@ class ConversationsNotifier extends ChangeNotifier
     // first send); only warm up the simple single-device-peer case here.
     final peerDevices = _deviceCache.peerDevices(convo.peerAccountId);
     if (peerDevices.length > 1) return;
+    // A warm-up group holds only the peer, so with sibling devices it would
+    // both miss them and race their own warm-up. Those accounts migrate via the
+    // all-devices path on first send (single designated initiator).
+    final session = await _sessions.current();
+    if (session == null) return;
+    if ((await _myDeviceList()).any((d) => d.deviceId != session.deviceId)) {
+      return;
+    }
 
     await _runLocked(conversationId, () async {
       final live = _byId[conversationId];

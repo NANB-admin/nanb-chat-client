@@ -10,6 +10,7 @@ import '../../../core/network/api_client.dart';
 import '../../../core/push/push_kind.dart';
 import '../../onboarding/session_repository.dart';
 import '../mls_migrator.dart';
+import '../models/control_migration_outcome.dart';
 import '../models/conversation.dart';
 import '../models/conversation_kind.dart';
 import '../models/crypto_mode.dart';
@@ -33,7 +34,14 @@ class ControlSender {
     required RatchetCore ratchetCore,
     required DeviceCache deviceCache,
     required int? Function() contentTtlSeconds,
-  })  : _host = host,
+    Future<ControlMigrationOutcome> Function(
+      Conversation convo,
+      String body, {
+      required bool force,
+      required String pushKind,
+    })? migrateMultiDevice,
+  })  : _migrateMultiDevice = migrateMultiDevice,
+        _host = host,
         _crypto = crypto,
         _api = api,
         _sessions = sessions,
@@ -48,6 +56,15 @@ class ControlSender {
   final RatchetCore _ratchetCore;
   final DeviceCache _deviceCache;
   final int? Function() _contentTtlSeconds;
+
+  /// Builds the all-devices MLS group for a multi-device 1:1 still on ratchet
+  /// and delivers the control inside it. Null in tests that don't need it.
+  final Future<ControlMigrationOutcome> Function(
+    Conversation convo,
+    String body, {
+    required bool force,
+    required String pushKind,
+  })? _migrateMultiDevice;
 
   /// Encrypts + submits a control [body] to the peer of [conversationId] through
   /// the same ratchet/MLS path as a normal message (no on-screen bubble); the
@@ -83,13 +100,29 @@ class ControlSender {
     }
     // Outside the lock: a cold directory costs one lookup, and the fallback
     // (the row's possibly-stale peerDeviceId) is exactly what rang dead phones.
-    if (allPeerDevices) {
+    final firstContactOnRatchet = convo.kind == ConversationKind.oneToOne &&
+        convo.cryptoMode == CryptoMode.ratchet;
+    if (allPeerDevices || firstContactOnRatchet) {
+      // A ratchet 1:1 may be about to migrate: we must know ALL the peer's
+      // devices first, or the group is built without the ones we can't see.
       await _warmPeerDirectory(convo.peerAccountId, convo.peerUsername);
     }
     await _host.runLocked(conversationId, () async {
       final live = _host.conversation(conversationId) ?? convo;
       final session = await _sessions.current();
       final myAccountId = session?.accountId ?? '';
+      var allowMigration = true;
+      final migrateMultiDevice = _migrateMultiDevice;
+      if (migrateMultiDevice != null) {
+        final outcome = await migrateMultiDevice(live, body,
+            force: forceMigration, pushKind: effectivePushKind);
+        if (outcome == ControlMigrationOutcome.migrated) {
+          // The multi-device migration already delivered the control.
+          onSealed?.call();
+          return;
+        }
+        allowMigration = outcome != ControlMigrationOutcome.deferToSibling;
+      }
       ConversationCryptoState? pendingRatchetState;
       final migrator = MlsMigrator(
         bridge: _crypto,
@@ -108,6 +141,7 @@ class ControlSender {
         convo: live,
         plaintext: utf8.encode(body),
         forceMigration: forceMigration,
+        allowMigration: allowMigration,
       );
       onSealed?.call();
       if (migResult.welcomeBytes != null) {

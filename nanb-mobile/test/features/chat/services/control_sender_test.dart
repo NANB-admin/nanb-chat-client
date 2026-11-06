@@ -3,6 +3,8 @@ import 'package:nanb_chat/core/crypto/crypto_bridge.dart';
 import 'package:nanb_chat/core/models/account.dart';
 import 'package:nanb_chat/core/models/jwt_session.dart';
 import 'package:nanb_chat/core/network/api_client.dart';
+import 'package:nanb_chat/core/push/push_kind.dart';
+import 'package:nanb_chat/features/chat/models/control_migration_outcome.dart';
 import 'package:nanb_chat/features/chat/models/conversation.dart';
 import 'package:nanb_chat/features/chat/models/conversation_kind.dart';
 import 'package:nanb_chat/features/chat/models/crypto_mode.dart';
@@ -140,7 +142,7 @@ Conversation _group(List<GroupMember> members) => Conversation(
     );
 
 class _Rig {
-  _Rig(Conversation convo) {
+  _Rig(Conversation convo, {ControlMigrationOutcome? migrationOutcome}) {
     api = _FakeApi(order);
     host = _FakeHost(convo, order);
     cache = DeviceCache(api: api);
@@ -152,8 +154,16 @@ class _Rig {
       ratchetCore: _FakeRatchet(),
       deviceCache: cache,
       contentTtlSeconds: () => null,
+      migrateMultiDevice: migrationOutcome == null
+          ? null
+          : (convo, body, {required force, required pushKind}) async {
+              migrationCalls.add((force: force, pushKind: pushKind));
+              return migrationOutcome;
+            },
     );
   }
+
+  final migrationCalls = <({bool force, String pushKind})>[];
 
   final order = <String>[];
   late final _FakeApi api;
@@ -166,7 +176,62 @@ class _Rig {
       [for (final p in host.submitted) p.recipientDeviceId];
 }
 
+Conversation _ratchetOneToOne() => const Conversation(
+      id: _convoId,
+      peerUsername: '@bob',
+      peerAccountId: 'acc-bob',
+      peerDeviceId: 'bob-1',
+      peerIdentityPubKey: [1],
+      peerX25519PubKey: [1, 2, 3],
+      messages: [],
+      unreadCount: 0,
+    );
+
 void main() {
+  group('multi-device migration of a ratchet 1:1', () {
+    test('a migrated control is not sent again through the single-peer path',
+        () async {
+      final rig = _Rig(_ratchetOneToOne(),
+          migrationOutcome: ControlMigrationOutcome.migrated);
+      rig.api.lookupResult = _bob(['bob-1', 'bob-2']);
+
+      await rig.sender.sendControl(_convoId, '{}');
+
+      expect(rig.host.submitted, isEmpty);
+    });
+
+    test('the migration is asked for with the re-establish force flag',
+        () async {
+      final rig = _Rig(_ratchetOneToOne(),
+          migrationOutcome: ControlMigrationOutcome.migrated);
+      rig.api.lookupResult = _bob(['bob-1', 'bob-2']);
+
+      await rig.sender.sendControl(_convoId, '{}', forceMigration: true);
+
+      expect(rig.migrationCalls.single.force, isTrue);
+    });
+
+    test('a migrated control goes out silent so it raises no banner', () async {
+      final rig = _Rig(_ratchetOneToOne(),
+          migrationOutcome: ControlMigrationOutcome.migrated);
+      rig.api.lookupResult = _bob(['bob-1', 'bob-2']);
+
+      await rig.sender.sendControl(_convoId, '{}');
+
+      expect(rig.migrationCalls.single.pushKind, PushKind.silent);
+    });
+
+    test('the peer directory is loaded before migrating', () async {
+      final rig = _Rig(_ratchetOneToOne(),
+          migrationOutcome: ControlMigrationOutcome.migrated);
+      rig.api.lookupResult = _bob(['bob-1', 'bob-2']);
+
+      await rig.sender.sendControl(_convoId, '{}');
+
+      expect(rig.api.lookups, 1);
+    });
+  });
+
   group('1:1 peer directory', () {
     test('a STALE peer device list is refreshed so a new device is addressed',
         () async {

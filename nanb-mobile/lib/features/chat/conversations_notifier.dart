@@ -40,6 +40,7 @@ import 'models/catchup_timing.dart';
 import 'models/chat_message.dart';
 import 'models/client_msg_id_header.dart';
 import 'models/conversation.dart';
+import 'models/control_migration_outcome.dart';
 import 'models/conversation_kind.dart';
 import 'models/crypto_mode.dart';
 import 'models/forward_marker.dart';
@@ -2522,7 +2523,7 @@ class ConversationsNotifier extends ChangeNotifier
   late final MlsReceiver _mlsReceiver = MlsReceiver(host: this, crypto: _crypto, api: _api, sessions: _sessions, deviceCache: _deviceCache, appender: _messageAppender, controlSender: _controlSender, appendUnknownPeerEnvelope: _appendUnknownPeerEnvelope, isUnknownPeerPlaceholder: _isUnknownPeerPlaceholder, recordPeerDisplayName: _recordPeerDisplayName, peerAccountFromOneToOneId: _peerAccountFromOneToOneId, retryLog: _retryLog, processedLog: _processedLog);
   late final RatchetReceiver _ratchetReceiver = RatchetReceiver(host: this, crypto: _crypto, ratchetCore: _ratchetCore, deviceCache: _deviceCache, appender: _messageAppender, isUnknownPeerPlaceholder: _isUnknownPeerPlaceholder, appendUnknownPeerEnvelope: _appendUnknownPeerEnvelope, warmDeviceCaches: _warmDeviceCaches, requestReestablish: (c, s, m) => _mlsReceiver.maybeReestablish(c, s, m, force: true));
   late final RatchetCore _ratchetCore = RatchetCore(crypto: _crypto, api: _api, db: _db, contentTtlSeconds: () => _contentTtlSeconds);
-  late final ControlSender _controlSender = ControlSender(host: this, crypto: _crypto, api: _api, sessions: _sessions, ratchetCore: _ratchetCore, deviceCache: _deviceCache, contentTtlSeconds: () => _contentTtlSeconds);
+  late final ControlSender _controlSender = ControlSender(host: this, crypto: _crypto, api: _api, sessions: _sessions, ratchetCore: _ratchetCore, deviceCache: _deviceCache, contentTtlSeconds: () => _contentTtlSeconds, migrateMultiDevice: _migrateForControl);
   late final ReactionService _reactionService = ReactionService(this, onPeerReaction: _notifyPeerReaction);
   late final MessageEditService _messageEditService = MessageEditService(this);
   late final LinkPreviewService _linkPreviewService = LinkPreviewService(this, source: () => _linkPreviewSource?.call());
@@ -3875,6 +3876,34 @@ class ConversationsNotifier extends ChangeNotifier
     return ids.every((id) => id.compareTo(myDeviceId) >= 0);
   }
 
+  /// The all-devices migration for a CONTROL send (receipt, call signal,
+  /// re-establish...). Without it a control on a multi-device 1:1 took the
+  /// single-peer migrator, which builds a two-member group holding one peer
+  /// device and none of our siblings — the other devices could never join.
+  Future<ControlMigrationOutcome> _migrateForControl(
+    Conversation convo,
+    String body, {
+    required bool force,
+    required String pushKind,
+  }) async {
+    if (convo.kind != ConversationKind.oneToOne ||
+        convo.cryptoMode != CryptoMode.ratchet) {
+      return ControlMigrationOutcome.notApplicable;
+    }
+    final session = await _sessions.current();
+    if (session == null || await _multiDeviceTargets(convo) == null) {
+      return ControlMigrationOutcome.notApplicable;
+    }
+    if (!await _isDesignatedInitiatorDevice(session.deviceId)) {
+      return ControlMigrationOutcome.deferToSibling;
+    }
+    final res = await _migrateAllDevicesToMls(convo, body,
+        force: force, pushKindOverride: pushKind);
+    return res == null
+        ? ControlMigrationOutcome.notApplicable
+        : ControlMigrationOutcome.migrated;
+  }
+
   /// Full multi-device MLS migration for a 1:1: builds a fresh MLS group whose
   /// members are EVERY device of the peer plus this account's own other devices
   /// (self-sync), encrypts [wireBody] once, and fans the Welcome + application
@@ -3886,6 +3915,7 @@ class ConversationsNotifier extends ChangeNotifier
     Conversation convo,
     String wireBody, {
     bool force = false,
+    String? pushKindOverride,
   }) async {
     final session = await _sessions.current();
     if (session == null) return null;
@@ -3906,9 +3936,9 @@ class ConversationsNotifier extends ChangeNotifier
     // Sibling devices of this account must not BOTH build the group: each
     // would Welcome the peer into its own group and fork the chat. Only the
     // lexically-smallest own device initiates; the others stay on ratchet and
-    // adopt its Welcome (it includes them as members). Forced rebuilds skip
-    // this for the same reason as above.
-    if (!force && !await _isDesignatedInitiatorDevice(session.deviceId)) {
+    // adopt its Welcome (it includes them as members). Applies to forced
+    // rebuilds too: two siblings each re-establishing is the same fork.
+    if (!await _isDesignatedInitiatorDevice(session.deviceId)) {
       return null;
     }
 
@@ -4017,9 +4047,10 @@ class ConversationsNotifier extends ChangeNotifier
           recipientDeviceId: r.deviceId,
           ciphertext: ct,
           ttlSeconds: _contentTtlSeconds,
-          pushKind: pushKindForRecipient(
-              recipientAccountId: r.accountId,
-              selfAccountId: session.accountId),
+          pushKind: pushKindOverride ??
+              pushKindForRecipient(
+                  recipientAccountId: r.accountId,
+                  selfAccountId: session.accountId),
         ));
         firstOk ??= res;
       } catch (e) {
@@ -4592,6 +4623,19 @@ class ConversationsNotifier extends ChangeNotifier
     }
     // Multi-device peers need the all-devices migration (handled lazily on the
     // first send); only warm up the simple single-device-peer case here.
+    // A cold or stale directory can hide the peer's second device, and a
+    // warm-up group built without it strands that device. If the directory
+    // can't be refreshed, don't warm up — the first send migrates properly.
+    if (_deviceCache.peerDevices(convo.peerAccountId).isEmpty ||
+        _deviceCache.peerDevicesStale(convo.peerAccountId)) {
+      try {
+        _recordPeerDisplayName(await _api
+            .lookupAccount(convo.peerUsername)
+            .timeout(const Duration(seconds: 5)));
+      } catch (_) {
+        return;
+      }
+    }
     final peerDevices = _deviceCache.peerDevices(convo.peerAccountId);
     if (peerDevices.length > 1) return;
     // A warm-up group holds only the peer, so with sibling devices it would

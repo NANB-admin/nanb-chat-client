@@ -602,6 +602,34 @@ void main() {
       expect(bridge.calls, contains('createGroup:$_convoId'));
     });
 
+    test('allowMigration false: the smaller account stays on ratchet', () async {
+      api.kpResult = _kpResult();
+      bridge.createGroupResult = _convoId;
+
+      final result = await migratorAs('aaron-acc').encryptForSend(
+        convo: _ratchetConvo(),
+        plaintext: _plaintext,
+        allowMigration: false,
+      );
+
+      expect(result.newMode, CryptoMode.ratchet);
+    });
+
+    test('allowMigration false: no group is created even when forced',
+        () async {
+      api.kpResult = _kpResult();
+      bridge.createGroupResult = _convoId;
+
+      await migratorAs('aaron-acc').encryptForSend(
+        convo: _ratchetConvo(),
+        plaintext: _plaintext,
+        forceMigration: true,
+        allowMigration: false,
+      );
+
+      expect(bridge.calls, isNot(contains('createGroup:$_convoId')));
+    });
+
     test('migrateOnly: the larger account returns null (no group created)',
         () async {
       api.kpResult = _kpResult();

@@ -68,6 +68,7 @@ class MlsMigrator {
     required Conversation convo,
     required List<int> plaintext,
     bool forceMigration = false,
+    bool allowMigration = true,
   }) async {
     if (convo.cryptoMode == CryptoMode.mls) {
       final ct = await bridge.encrypt(groupId: convo.id, plaintext: plaintext);
@@ -77,6 +78,10 @@ class MlsMigrator {
         ciphertext: ct,
       );
     }
+
+    // A sibling device owns this chat's migration (multi-device 1:1): stay on
+    // ratchet here instead of building a competing group.
+    if (!allowMigration) return _encryptOnRatchet(convo, plaintext);
 
     // ratchet-mode — attempt migration only if we're the designated initiator
     // (the smaller account; see [_initiatesMigration]). The larger account stays

@@ -1660,6 +1660,7 @@ class ConversationsNotifier extends ChangeNotifier
       {bool emitLeaveCommits = true}) async {
     final convo = _byId.remove(conversationId);
     if (convo == null) return;
+    _siblingDeferredAt.remove(conversationId);
     if (convo.kind == ConversationKind.group) {
       // BEFORE the wipe below — producing Commits needs the live MLS group.
       if (emitLeaveCommits) await _emitSelfLeaveCommits(convo);
@@ -3272,6 +3273,15 @@ class ConversationsNotifier extends ChangeNotifier
       // message would stay undecryptable, so keep the placeholder.
       if (account.x25519PubKey.isEmpty) return false;
       _recordPeerDisplayName(account);
+      // The sender may be a LINKED device: its ratchet is keyed on its OWN
+      // X25519, not the account's primary one. Seeding with the primary key made
+      // that first message undecryptable (SecretBoxAuthenticationError).
+      final senderX25519 = account.devices
+          .where((d) =>
+              d.deviceId == env.senderDeviceId && d.x25519PubKey.isNotEmpty)
+          .map((d) => d.x25519PubKey)
+          .firstOrNull;
+      final peerX25519 = senderX25519 ?? account.x25519PubKey;
 
       final convo = Conversation(
         id: expectedId,
@@ -3281,7 +3291,7 @@ class ConversationsNotifier extends ChangeNotifier
         // over the account lookup's "primary device".
         peerDeviceId: env.senderDeviceId,
         peerIdentityPubKey: account.identityPubKey,
-        peerX25519PubKey: account.x25519PubKey,
+        peerX25519PubKey: peerX25519,
         messages: const [],
         unreadCount: 0,
         // Inbound-created = a message request: the user never contacted
@@ -3292,7 +3302,7 @@ class ConversationsNotifier extends ChangeNotifier
       await _db.upsertConversation(convo);
       final initialState = await _crypto.initConversationCrypto(
         conversationId: expectedId,
-        peerX25519PubKey: account.x25519PubKey,
+        peerX25519PubKey: peerX25519,
       );
       await _db.saveConversationCryptoState(initialState);
       notifyListeners();
@@ -3866,6 +3876,14 @@ class ConversationsNotifier extends ChangeNotifier
     return recipients;
   }
 
+  /// How long a non-elected sibling defers a 1:1's initial MLS migration before
+  /// taking it over itself. The elected (smallest-id) sibling may simply not
+  /// hold this chat — a self-synced first message creates no row on it — and
+  /// would then never start the group, stranding the chat on ratchet.
+  Duration siblingInitiatorGrace = const Duration(seconds: 45);
+
+  final Map<String, DateTime> _siblingDeferredAt = {};
+
   /// True when [myDeviceId] is the lexically-smallest of this account's devices
   /// (or the only one), i.e. the one device allowed to start a 1:1's initial
   /// MLS migration. Every sibling computes the same answer from the same list.
@@ -3874,6 +3892,26 @@ class ConversationsNotifier extends ChangeNotifier
       for (final d in await _myDeviceList()) d.deviceId,
     ];
     return ids.every((id) => id.compareTo(myDeviceId) >= 0);
+  }
+
+  /// Whether this device may start [convoId]'s initial migration now: always
+  /// the elected sibling, and any other sibling once it has deferred for
+  /// [siblingInitiatorGrace] without the chat having moved to MLS.
+  Future<bool> _mayInitiateMigration(String convoId, String myDeviceId) async {
+    if (await _isDesignatedInitiatorDevice(myDeviceId)) {
+      _siblingDeferredAt.remove(convoId);
+      return true;
+    }
+    final now = DateTime.now();
+    var since = _siblingDeferredAt[convoId];
+    // A deferral older than a few graces is a leftover of an EARLIER attempt
+    // (the chat has since been deleted, rebuilt or re-contacted): start over,
+    // or the next re-contact would skip the wait and race the elected device.
+    if (since == null || now.difference(since) > siblingInitiatorGrace * 4) {
+      since = now;
+      _siblingDeferredAt[convoId] = now;
+    }
+    return now.difference(since) >= siblingInitiatorGrace;
   }
 
   /// The all-devices migration for a CONTROL send (receipt, call signal,
@@ -3894,7 +3932,7 @@ class ConversationsNotifier extends ChangeNotifier
     if (session == null || await _multiDeviceTargets(convo) == null) {
       return ControlMigrationOutcome.notApplicable;
     }
-    if (!await _isDesignatedInitiatorDevice(session.deviceId)) {
+    if (!await _mayInitiateMigration(convo.id, session.deviceId)) {
       return ControlMigrationOutcome.deferToSibling;
     }
     final res = await _migrateAllDevicesToMls(convo, body,
@@ -3938,7 +3976,7 @@ class ConversationsNotifier extends ChangeNotifier
     // lexically-smallest own device initiates; the others stay on ratchet and
     // adopt its Welcome (it includes them as members). Applies to forced
     // rebuilds too: two siblings each re-establishing is the same fork.
-    if (!await _isDesignatedInitiatorDevice(session.deviceId)) {
+    if (!await _mayInitiateMigration(convo.id, session.deviceId)) {
       return null;
     }
 
@@ -4029,6 +4067,7 @@ class ConversationsNotifier extends ChangeNotifier
     //    one, voiding every message sent under the earlier groups.
     final migrated = convo.copyWith(cryptoMode: CryptoMode.mls);
     _byId[convo.id] = migrated;
+    _siblingDeferredAt.remove(convo.id);
     await _db.upsertConversation(migrated);
     try {
       await _db.deleteConversationCryptoState(convo.id);

@@ -836,12 +836,17 @@ class MlsReceiver {
       // (it rides the migrator's send path, which migrates a ratchet-mode
       // convo: createGroup + addMember + Welcome + this payload).
       debugPrint('mls: re-establishing diverged group on $convoId');
-      // forceMigration: a re-establishment must rebuild the group even from the
-      // larger account (which the deterministic-migration rule normally keeps on
-      // ratchet) — otherwise a stranded follower could never recover.
+      // Only the LEADER (smaller account) builds the replacement group. The
+      // follower's control goes out on ratchet: the leader sees a text_legacy
+      // for a convo it holds as MLS, rebuilds, and the follower adopts that
+      // Welcome. A follower that built its own group here collided with the
+      // leader's rebuild (two Welcome rounds, the first messages lost) after a
+      // delete + re-contact. Unknown account ids keep the old forced rebuild.
+      final roleKnown = myAccountId.isNotEmpty && peerAccountId.isNotEmpty;
+      final iAmFollower = roleKnown && waitsForPeer;
       await _controlSender.sendControl(
           convoId, const MessageControl.reestablish().encode(),
-          forceMigration: true);
+          forceMigration: !iAmFollower);
     } catch (e) {
       debugPrint('mls re-establish failed on $convoId: $e');
     } finally {

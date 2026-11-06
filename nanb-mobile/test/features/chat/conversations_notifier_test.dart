@@ -2370,6 +2370,34 @@ void main() {
       expect(loaded.singleWhere((c) => c.id == convoId).pending, isTrue);
     });
 
+    test('a request from a linked device uses that device own X25519 key',
+        () async {
+      await sessions.save(session);
+      await notifier.connect();
+      final convoId = Conversation.oneToOneId('me-acc', _peerAccountId);
+      when(() => api.lookupAccountByDevice('peer-linked')).thenAnswer((_) async =>
+          const Account(
+            accountId: _peerAccountId,
+            username: _peerUsername,
+            identityPubKey: [9, 8, 7],
+            x25519PubKey: [1, 2, 3],
+            deviceId: 'peer-dev',
+            devices: [
+              AccountDevice(deviceId: 'peer-dev', x25519PubKey: [1, 2, 3]),
+              AccountDevice(deviceId: 'peer-linked', x25519PubKey: [4, 5, 6]),
+            ],
+          ));
+
+      ws.push(_envelope(
+        conversationId: convoId,
+        senderDeviceId: 'peer-linked',
+        envelopeType: EnvelopeType.textLegacy,
+      ));
+      await pumpEventQueue();
+
+      expect(notifier.byId(convoId)!.peerX25519PubKey, [4, 5, 6]);
+    });
+
     test('unresolvable unknown-sender placeholder is pending too', () async {
       await sessions.save(session);
       await notifier.connect();
@@ -5049,6 +5077,18 @@ void main() {
       expect(notifier.byId(convoId)!.cryptoMode, CryptoMode.ratchet);
     });
 
+    test('a sibling that is not elected takes over once the grace has passed',
+        () async {
+      // The elected sibling may not hold this chat at all (a self-synced first
+      // message creates no row on it), so deferring forever strands the chat
+      // on ratchet.
+      notifier.siblingInitiatorGrace = Duration.zero;
+
+      final convoId = await startFirstContactWithSibling('a-dev');
+
+      expect(notifier.byId(convoId)!.cryptoMode, CryptoMode.mls);
+    });
+
     test('the smallest-id device starts the MLS group and welcomes its sibling',
         () async {
       await startFirstContactWithSibling('z-dev');
@@ -6148,6 +6188,61 @@ void main() {
 
       // Re-migrated: a fresh Welcome went to the peer.
       expect(submittedTypes, contains(EnvelopeType.mlsWelcome));
+    });
+
+    Future<List<String>> followerLosesItsGroup() async {
+      await sessions.save(session);
+      await notifier.connect();
+      // The peer's account id sorts BEFORE ours, so we are the follower.
+      when(() => api.lookupAccount(_peerUsername)).thenAnswer((_) async =>
+          const Account(
+            accountId: 'aaa-acc',
+            username: _peerUsername,
+            identityPubKey: [9, 8, 7],
+            x25519PubKey: [1, 2, 3],
+            deviceId: 'peer-dev',
+          ));
+      final convoId = await notifier.startConversation(
+        myDeviceId: _myDeviceId,
+        username: _peerUsername,
+      );
+      crypto.currentEpochError = const MlsUnknownGroupException('no group');
+      when(() => api.lookupKeyPackage(any())).thenAnswer(
+        (_) async => FetchKeyPackageResult(
+          keyPackage: List<int>.filled(64, 0xBB),
+          replenishNeeded: false,
+          remainingForUser: 9,
+        ),
+      );
+      final submittedTypes = <String>[];
+      when(() => api.submitMessage(any())).thenAnswer((inv) async {
+        submittedTypes.add(
+            (inv.positionalArguments.first as SubmitMessagePayload).envelopeType);
+        return SubmitMessageResult(
+            envelopeId: 'srv', serverTs: DateTime.utc(2026));
+      });
+      ws.push(_envelope(
+          conversationId: convoId,
+          senderDeviceId: 'peer-dev',
+          envelopeId: 'follower-1'));
+      // The follower first gives the leader a grace window to rebuild.
+      await Future<void>.delayed(const Duration(seconds: 8));
+      await pumpEventQueue(times: 100);
+      return submittedTypes;
+    }
+
+    test('a follower that lost its group does not build a group of its own',
+        () async {
+      final submittedTypes = await followerLosesItsGroup();
+
+      expect(submittedTypes, isNot(contains(EnvelopeType.mlsWelcome)));
+    });
+
+    test('a follower that lost its group tells the leader over ratchet',
+        () async {
+      final submittedTypes = await followerLosesItsGroup();
+
+      expect(submittedTypes, contains(EnvelopeType.textLegacy));
     });
 
     // Regression, measured on-device 2026-08-20: the peer deleted the thread

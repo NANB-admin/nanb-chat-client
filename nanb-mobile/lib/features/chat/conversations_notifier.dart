@@ -15,6 +15,7 @@ import '../../core/models/account.dart';
 import '../../core/models/api_error.dart';
 import '../../core/models/device.dart';
 import '../../core/models/envelope.dart' as wire;
+import '../../core/models/jwt_session.dart';
 import '../../core/models/report_reason.dart';
 import '../../core/network/api_client.dart';
 import '../../core/network/connection_state.dart';
@@ -63,14 +64,14 @@ import 'services/conversation_state_store.dart';
 import 'services/conversation_state_sync_service.dart';
 import 'services/control_receiver.dart';
 import 'services/control_sender.dart';
-import 'services/adder_election.dart';
 import 'services/device_cache.dart';
 import 'services/envelope_retry_log.dart';
 import 'services/processed_envelope_log.dart';
 import 'services/disappearing_sweep.dart';
 import 'services/key_package_replenisher.dart';
+import 'services/own_device_gap_finder.dart';
+import 'services/visible_payload.dart';
 import 'services/group_manager.dart';
-import 'services/persisted_marker_set.dart';
 import 'services/media_cache.dart';
 import 'services/message_appender.dart';
 import 'services/mls_receiver.dart';
@@ -87,7 +88,13 @@ import 'services/sealed_sender.dart';
 import 'services/share_send_target.dart';
 import 'services/sticker_marker.dart';
 import 'services/temp_media_store.dart';
+import 'services/transport_receipt_log.dart';
+import 'services/group_established_log.dart';
+import 'services/group_recovery_service.dart';
+import 'services/rebuild_throttle.dart';
+import 'services/resend_ledger.dart';
 import 'services/typing_service.dart';
+import 'services/unconfirmed_message_resender.dart';
 import 'services/upload_worker.dart';
 import '../calls/models/call_signal.dart';
 import 'services/delete_sync_service.dart';
@@ -272,6 +279,40 @@ class ConversationsNotifier extends ChangeNotifier
       EnvelopeRetryLog(storage: _secureStorage);
   late final ProcessedEnvelopeLog _processedLog =
       ProcessedEnvelopeLog(storage: _secureStorage);
+  late final TransportReceiptLog _transportReceipts =
+      TransportReceiptLog(storage: _secureStorage);
+  late final UnconfirmedMessageResender _resender = UnconfirmedMessageResender(
+    host: this,
+    crypto: _crypto,
+    transportReceipts: _transportReceipts,
+    ledger: ResendLedger(storage: _secureStorage),
+    fanoutRecipients: _mlsFanoutRecipients,
+    settleDelay: () => resendSettleDelay,
+  );
+
+  late final GroupEstablishedLog _groupEstablished =
+      GroupEstablishedLog(storage: _secureStorage);
+  late final GroupRecoveryService _groupRecovery = GroupRecoveryService(
+    host: this,
+    crypto: _crypto,
+    api: _api,
+    sessions: _sessions,
+    storage: _secureStorage,
+    onRejoined: _resumeFailedTextSends,
+  );
+
+  /// How long each further rebuild of a chat must wait. See [RebuildThrottle].
+  List<Duration> rebuildWaits = RebuildThrottle.defaultWaits;
+
+  /// How often a connected device re-checks for messages the peer never
+  /// confirmed. A socket can stay up for hours, so reconnects alone aren't enough.
+  static const Duration _resendSweepInterval = Duration(minutes: 10);
+  Timer? _resendSweepTimer;
+
+  /// How long a new MLS group must stay quiet before this device re-sends what
+  /// the peer never confirmed: long enough for the Welcome to land first and for
+  /// a Welcome collision to settle.
+  Duration resendSettleDelay = const Duration(seconds: 2);
 
   /// Envelope ids acked during the CURRENT catchup drain, or null when no drain
   /// is running. Populated by [ack] — the one chokepoint every path funnels
@@ -365,10 +406,9 @@ class ConversationsNotifier extends ChangeNotifier
   /// sync by [_persistCallPeerNames].
   static const String callPeerNamesKey = 'push.call_peer_names';
 
-  /// SecureStorage key holding the JSON array of own-device ids last seen by
-  /// [_reconcileOwnDevicesIntoGroups]. A device id present in the server's
-  /// fleet but NOT here is newly linked, so the designated existing device adds
-  /// it to every already-migrated MLS conversation.
+  /// Written by builds before 54, which remembered the devices they had seen
+  /// instead of checking who is really in each group. No longer used; deleted on
+  /// sign-out so an old build's list doesn't linger.
   static const String knownOwnDevicesKey = 'mls.known_own_devices';
 
   /// SecureStorage key holding a JSON array of `"<deviceId>|<convoId>"` markers
@@ -378,10 +418,9 @@ class ConversationsNotifier extends ChangeNotifier
   /// not a correctness one.
   static const String backfilledHistoryKey = 'mls.backfilled_history';
 
-  /// SecureStorage key holding a JSON array of `"<deviceId>|<convoId>"` markers
-  /// for (newly-linked device, conversation) pairs this device has ALREADY
-  /// added to the MLS group, so a retried sweep never re-adds (a duplicate add
-  /// would throw / fork).
+  /// Written by builds before 54 to remember which devices they had added to
+  /// which groups. No longer used: the group itself says who is in it. Deleted on
+  /// sign-out.
   static const String ownDeviceAddedKey = 'mls.own_device_added';
 
   final Map<String, Conversation> _byId = {};
@@ -685,6 +724,14 @@ class ConversationsNotifier extends ChangeNotifier
         const Duration(minutes: 1),
         (_) => unawaited(runDisappearingSweepNow()),
       );
+      _resendSweepTimer?.cancel();
+      _resendSweepTimer = Timer.periodic(
+        _resendSweepInterval,
+        (_) {
+          unawaited(_resender.sweep());
+          unawaited(_reconcileOwnDevicesIntoGroups());
+        },
+      );
       // Plan D: register FCM token with server after JWT is in place.
       // Best-effort — failures are swallowed by the registrar.
       unawaited(_pushRegistrar.bootstrap());
@@ -720,9 +767,9 @@ class ConversationsNotifier extends ChangeNotifier
       _sealedSender.reportCommitmentIfNeeded();
       // Pre-warm this account's own-device list so self-synced messages from a
       // sibling device render as `mine` even on a receive-only linked device.
-      // Also adds any freshly-linked own device into already-migrated MLS 1:1
-      // groups (it resets + repopulates the same cache).
-      unawaited(_reconcileOwnDevicesIntoGroups());
+      // Adding missing devices waits for the catchup in [_onSupervisorEvent]: a
+      // sweep before it can't see a Commit that already added them.
+      unawaited(_myDeviceList());
       // Surface the OS notification-permission prompt on first sign-in. The
       // gate persists a flag so subsequent cold-starts don't re-spam the user;
       // they can re-enable from system settings if they previously declined.
@@ -755,6 +802,12 @@ class ConversationsNotifier extends ChangeNotifier
     _connected = false;
     _disappearingSweepTimer?.cancel();
     _disappearingSweepTimer = null;
+    _resendSweepTimer?.cancel();
+    _resendSweepTimer = null;
+    _ownDeviceRankTimer?.cancel();
+    _ownDeviceRankTimer = null;
+    _ownDeviceRetryTimer?.cancel();
+    _ownDeviceRetryTimer = null;
   }
 
   /// Non-destructive sign-out: tears down the live connection and raises the
@@ -884,11 +937,16 @@ class ConversationsNotifier extends ChangeNotifier
   Future<void> _onSupervisorEvent(WsConnectionEvent ev) async {
     switch (ev) {
       case Reconnected():
+        // Before the drain: the drain makes peers rebuild, and a Welcome built
+        // from a package of the destroyed store can never be opened.
+        await _keyPackageReplenisher.replaceIfStoreWasReset();
         await _runCatchup();
         await replenishKeyPackagesIfNeeded();
+        unawaited(_reconcileOwnDevicesIntoGroups());
         _reconfirmDeliveredReceipts();
         _reassertPrivacyFlags();
         _resumeFailedTextSends();
+        unawaited(_resender.sweep());
       case SignedOut():
         await clearLocalData();
     }
@@ -1088,6 +1146,7 @@ class ConversationsNotifier extends ChangeNotifier
       // re-establishment).
       final drainedIds = <String>{};
       _drainAckedIds = <String>{};
+      _retryLog.beginPass();
       for (var page = 0; page < _maxCatchupPages; page++) {
         final List<wire.Envelope> envs;
         if (pending != null) {
@@ -1274,6 +1333,7 @@ class ConversationsNotifier extends ChangeNotifier
     } finally {
       _catchupRunning = false;
       _drainAckedIds = null;
+      _retryLog.endPass();
       // This drain is over either way — a count that outlived it would keep the
       // veil up over a list nothing is still rearranging. On the failure path
       // [_initialCatchupDone] stays false on purpose, so this is the only thing
@@ -1305,10 +1365,12 @@ class ConversationsNotifier extends ChangeNotifier
     for (final convo in _byId.values.toList()) {
       if (convo.kind != ConversationKind.oneToOne || convo.blocked) continue;
       final eids = <String>[];
+      var reconfirmed = 0;
       for (final m in convo.messages.reversed) {
-        if (eids.length >= _deliveredReconfirmLimit) break;
+        if (reconfirmed >= _deliveredReconfirmLimit) break;
         if (m.mine || m.kind == MessageKind.system) continue;
-        eids.add(m.envelopeId);
+        reconfirmed++;
+        eids.addAll([m.envelopeId, ?m.clientMsgId]);
       }
       if (eids.isEmpty) continue;
       unawaited(Future(() async {
@@ -1751,12 +1813,16 @@ class ConversationsNotifier extends ChangeNotifier
     required String groupName,
     required String selfUsername,
     required List<MemberSeed> initialMembers,
-  }) =>
-      _groupManager.createGroup(
-        groupName: groupName,
-        selfUsername: selfUsername,
-        initialMembers: initialMembers,
-      );
+  }) {
+    // A new group should start with every device: don't build it from a list
+    // that may be two minutes old.
+    _deviceCache.clearMyDevices();
+    return _groupManager.createGroup(
+      groupName: groupName,
+      selfUsername: selfUsername,
+      initialMembers: initialMembers,
+    );
+  }
 
   /// Add a member to an existing group. Delegates to [GroupManager].
   Future<void> addMemberToGroup({
@@ -2520,11 +2586,15 @@ class ConversationsNotifier extends ChangeNotifier
   late final KeyPackageReplenisher _keyPackageReplenisher = KeyPackageReplenisher(api: _api, crypto: _crypto, storage: _secureStorage);
   late final DisappearingSweep _disappearingSweep = DisappearingSweep(host: this, mediaCache: _mediaCache, tempMediaStore: _tempMediaStore, ttlProvider: () => _ttlProvider?.call());
   late final ControlReceiver _controlReceiver = ControlReceiver(host: this, receipts: _receiptService, requestDecisions: _requestDecisions, sealedSender: _sealedSender, reactions: _reactionService, pins: _pinService, groupAvatars: _groupAvatarService, linkPreviews: _linkPreviewService, edits: _messageEditService, deleteSync: _deleteSync, stateApplier: _stateApplier, conversationDeleteSync: _conversationDeleteSync, groupDisband: _groupDisband, deleteMessageLocal: deleteMessageLocal, appendSystemEvent: _appendSystemEventLocked);
-  late final MessageAppender _messageAppender = MessageAppender(host: this, controlReceiver: _controlReceiver, controlSender: _controlSender, callSignalHandler: () => onCallSignal, applyGroupInfo: _applyGroupInfo, notifications: _localNotifications, appInForeground: () => appInForeground, activeConversationId: () => _openConversationId, isCatchupEnvelope: (id) => _catchupEnvelopeIds.contains(id));
-  late final MlsReceiver _mlsReceiver = MlsReceiver(host: this, crypto: _crypto, api: _api, sessions: _sessions, deviceCache: _deviceCache, appender: _messageAppender, controlSender: _controlSender, appendUnknownPeerEnvelope: _appendUnknownPeerEnvelope, isUnknownPeerPlaceholder: _isUnknownPeerPlaceholder, recordPeerDisplayName: _recordPeerDisplayName, peerAccountFromOneToOneId: _peerAccountFromOneToOneId, retryLog: _retryLog, processedLog: _processedLog);
+  late final MessageAppender _messageAppender = MessageAppender(onRebuildRequested: (env, device) => _mlsReceiver.onRebuildRequested(env, device), host: this, controlReceiver: _controlReceiver, controlSender: _controlSender, callSignalHandler: () => onCallSignal, applyGroupInfo: _applyGroupInfo, notifications: _localNotifications, appInForeground: () => appInForeground, activeConversationId: () => _openConversationId, isCatchupEnvelope: (id) => _catchupEnvelopeIds.contains(id));
+  late final MlsReceiver _mlsReceiver = MlsReceiver(host: this, crypto: _crypto, api: _api, sessions: _sessions, deviceCache: _deviceCache, appender: _messageAppender, controlSender: _controlSender, appendUnknownPeerEnvelope: _appendUnknownPeerEnvelope, isUnknownPeerPlaceholder: _isUnknownPeerPlaceholder, recordPeerDisplayName: _recordPeerDisplayName, peerAccountFromOneToOneId: _peerAccountFromOneToOneId, retryLog: _retryLog, processedLog: _processedLog, onGroupChanged: (id) {
+    _resender.onGroupChanged(id);
+    // A new group can bring one of our devices back, or leave one out.
+    unawaited(Future(() => _reconcileOwnDevicesIntoGroups()));
+  }, establishedLog: _groupEstablished, rebuildThrottle: RebuildThrottle(storage: _secureStorage, waits: () => rebuildWaits), onDeadWelcome: () => unawaited(_keyPackageReplenisher.replaceSuspectPool()), onGroupLost: (id) => unawaited(_groupRecovery.requestRejoin(id)), onGroupJoined: (id) => unawaited(_groupRecovery.onJoinedFromWelcome(id)));
   late final RatchetReceiver _ratchetReceiver = RatchetReceiver(host: this, crypto: _crypto, ratchetCore: _ratchetCore, deviceCache: _deviceCache, appender: _messageAppender, isUnknownPeerPlaceholder: _isUnknownPeerPlaceholder, appendUnknownPeerEnvelope: _appendUnknownPeerEnvelope, warmDeviceCaches: _warmDeviceCaches, requestReestablish: (c, s, m) => _mlsReceiver.maybeReestablish(c, s, m, force: true));
   late final RatchetCore _ratchetCore = RatchetCore(crypto: _crypto, api: _api, db: _db, contentTtlSeconds: () => _contentTtlSeconds);
-  late final ControlSender _controlSender = ControlSender(host: this, crypto: _crypto, api: _api, sessions: _sessions, ratchetCore: _ratchetCore, deviceCache: _deviceCache, contentTtlSeconds: () => _contentTtlSeconds, migrateMultiDevice: _migrateForControl);
+  late final ControlSender _controlSender = ControlSender(onGroupChanged: _noteGroupBuiltHere, host: this, crypto: _crypto, api: _api, sessions: _sessions, ratchetCore: _ratchetCore, deviceCache: _deviceCache, contentTtlSeconds: () => _contentTtlSeconds, migrateMultiDevice: _migrateForControl, fanoutTargets: _multiDeviceTargets);
   late final ReactionService _reactionService = ReactionService(this, onPeerReaction: _notifyPeerReaction);
   late final MessageEditService _messageEditService = MessageEditService(this);
   late final LinkPreviewService _linkPreviewService = LinkPreviewService(this, source: () => _linkPreviewSource?.call());
@@ -2547,7 +2617,8 @@ class ConversationsNotifier extends ChangeNotifier
   );
   late final CallSignalingService _callSignaling = CallSignalingService(this);
   late final TypingService _typingService = TypingService(this);
-  late final ReceiptService _receiptService = ReceiptService(this);
+  late final ReceiptService _receiptService =
+      ReceiptService(this, transportReceipts: _transportReceipts);
   late final ReportService _reportService =
       ReportService(api: _api, db: _db);
   late final RequestDecisionService _requestDecisions =
@@ -2926,6 +2997,9 @@ class ConversationsNotifier extends ChangeNotifier
     // existing MLS 1:1 groups). Ephemeral — no envelope id, so nothing to ack,
     // and detached so it never holds up the receive pipeline.
     if (env.envelopeType == wire.EnvelopeType.devicesChanged) {
+      _deviceCache.clearMyDevices();
+      _ownDeviceRetryAt.clear();
+      _ownDeviceMisses.clear();
       unawaited(_reconcileOwnDevicesIntoGroups());
       return;
     }
@@ -2935,7 +3009,8 @@ class ConversationsNotifier extends ChangeNotifier
       return _runLocked(
         env.conversationId,
         () => _receiptService.applyReceipt(
-            env.conversationId, ReceiptKind.delivered, [deliveredId]),
+            env.conversationId, ReceiptKind.delivered, [deliveredId],
+            transportOnly: true),
       );
     }
     // A sealed, signed transport "delivered" the recipient's FCM background
@@ -2946,6 +3021,11 @@ class ConversationsNotifier extends ChangeNotifier
     // monotonically, then ack the (real, stored) outer envelope.
     if (env.envelopeType == wire.EnvelopeType.deliveredReceipt) {
       await _applySealedDeliveredReceipt(env);
+      await ack([env.envelopeId]);
+      return;
+    }
+    if (env.envelopeType == wire.EnvelopeType.groupRecovery) {
+      await _groupRecovery.onEnvelope(env);
       await ack([env.envelopeId]);
       return;
     }
@@ -3093,9 +3173,11 @@ class ConversationsNotifier extends ChangeNotifier
 
 
 
-  /// True (after ack+drop) when [env] came from one of this account's own
-  /// devices and we hold no real conversation for it; also removes an
-  /// 'unknown' stub an earlier build made for it. False means: not residue.
+  /// True when [env] came from one of this account's own devices and we hold no
+  /// real conversation for it. Either it is residue (acked and dropped, and an
+  /// 'unknown' stub an earlier build made for it removed), or it starts a chat
+  /// our other device opened (the chat is seeded and [env] left for the caller
+  /// to decrypt into it). False means: neither.
   Future<bool> _dropOwnDeviceResidue(wire.Envelope env) async {
     final session = await _sessions.current();
     if (session == null) return false;
@@ -3104,10 +3186,68 @@ class ConversationsNotifier extends ChangeNotifier
     }
     final existing = _byId[env.conversationId];
     if (existing != null && !_isUnknownPeerPlaceholder(existing)) return false;
+    // ...unless it is the first message of a chat our other device just
+    // started. Dropping that lost the message here and left the chat to show
+    // up later as a "request" from the peer, on our own device.
+    if (await _seedChatStartedOnSibling(env, session)) return true;
     if (existing != null) await deleteConversation(env.conversationId);
     try {
       await ack([env.envelopeId]);
     } catch (_) {/* best-effort; the next catchup retries */}
+    return true;
+  }
+
+  /// Seeds the 1:1 that one of our other devices started, when [env] (from that
+  /// device) opens to a message the user would see. The caller then decrypts
+  /// it into the new row as usual. Read positions, receipts and other control
+  /// traffic for a chat deleted here don't qualify, so they are still dropped.
+  Future<bool> _seedChatStartedOnSibling(
+      wire.Envelope env, JwtSession session) async {
+    if (env.envelopeType != wire.EnvelopeType.textLegacy) return false;
+    final peerAccountId =
+        _peerAccountFromOneToOneId(env.conversationId, session.accountId);
+    if (peerAccountId.isEmpty) return false;
+    final sibling = _deviceCache
+        .myDevicesSync()
+        .where((d) => d.deviceId == env.senderDeviceId)
+        .toList();
+    if (sibling.isEmpty || sibling.single.x25519PubKey.isEmpty) return false;
+    final List<int> plaintext;
+    try {
+      // A throwaway chain: nothing is stored until the real decrypt.
+      final fresh = await _crypto.initConversationCrypto(
+        conversationId: env.conversationId,
+        peerX25519PubKey: sibling.single.x25519PubKey,
+      );
+      plaintext = (await _crypto.decryptMessage(
+              state: fresh, ciphertext: env.ciphertext))
+          .plaintext;
+    } catch (_) {
+      return false;
+    }
+    if (!VisiblePayload.isVisible(utf8.decode(plaintext, allowMalformed: true))) {
+      return false;
+    }
+    final Account peer;
+    try {
+      peer = await _api.lookupAccountById(peerAccountId);
+    } catch (_) {
+      return false; // Offline: the envelope stays and is retried.
+    }
+    _recordPeerDisplayName(peer);
+    final convo = Conversation(
+      id: env.conversationId,
+      peerUsername: peer.username,
+      peerAccountId: peer.accountId,
+      peerDeviceId: peer.deviceId ?? '',
+      peerIdentityPubKey: peer.identityPubKey,
+      peerX25519PubKey: peer.x25519PubKey,
+      messages: const [],
+      unreadCount: 0,
+    );
+    _byId[convo.id] = convo;
+    await _db.upsertConversation(convo);
+    notifyListeners();
     return true;
   }
 
@@ -3883,6 +4023,7 @@ class ConversationsNotifier extends ChangeNotifier
   Duration siblingInitiatorGrace = const Duration(seconds: 45);
 
   final Map<String, DateTime> _siblingDeferredAt = {};
+  final Map<String, Timer> _forcedRebuildRetries = {};
 
   /// True when [myDeviceId] is the lexically-smallest of this account's devices
   /// (or the only one), i.e. the one device allowed to start a 1:1's initial
@@ -3929,17 +4070,88 @@ class ConversationsNotifier extends ChangeNotifier
       return ControlMigrationOutcome.notApplicable;
     }
     final session = await _sessions.current();
-    if (session == null || await _multiDeviceTargets(convo) == null) {
+    if (session == null) return ControlMigrationOutcome.notApplicable;
+    if (await _multiDeviceTargets(convo) == null &&
+        await _singlePeerMigrationIsSafe(convo, force: force)) {
       return ControlMigrationOutcome.notApplicable;
     }
     if (!await _mayInitiateMigration(convo.id, session.deviceId)) {
+      if (force) _retryForcedRebuildAfterGrace(convo.id, body, pushKind);
       return ControlMigrationOutcome.deferToSibling;
     }
     final res = await _migrateAllDevicesToMls(convo, body,
         force: force, pushKindOverride: pushKind);
-    return res == null
-        ? ControlMigrationOutcome.notApplicable
-        : ControlMigrationOutcome.migrated;
+    if (res != null) {
+      _forcedRebuildFailures.remove(convo.id);
+      return ControlMigrationOutcome.migrated;
+    }
+    if (force) {
+      final failures = (_forcedRebuildFailures[convo.id] ?? 0) + 1;
+      _forcedRebuildFailures[convo.id] = failures;
+      if (failures <= _maxForcedRebuildFailures) {
+        _retryForcedRebuildAfterGrace(convo.id, body, pushKind);
+      }
+    }
+    return ControlMigrationOutcome.stayOnRatchet;
+  }
+
+  /// Rebuilds that couldn't get the packages they needed, per conversation. The
+  /// peer may have none for days, so retries stop here until a later trigger.
+  final Map<String, int> _forcedRebuildFailures = {};
+  static const int _maxForcedRebuildFailures = 5;
+
+  /// True only when a server lookup CONFIRMS this 1:1 has exactly the devices on
+  /// its row: one peer device and none of our own besides this one. The one-device
+  /// migration builds a group of just those two, and takes whichever package the
+  /// server pops for the account, so with any other device around (or a stale row)
+  /// it strands devices or addresses a Welcome nobody can open. A failed lookup
+  /// isn't confirmation: on a bad connection it used to look like "single device".
+  Future<bool> _singlePeerMigrationIsSafe(Conversation convo,
+      {bool force = false}) async {
+    final session = await _sessions.current();
+    if (session == null) return false;
+    // A follower won't migrate on this send anyway, so skip the round trips.
+    final isFollower = session.accountId.isNotEmpty &&
+        convo.peerAccountId.isNotEmpty &&
+        session.accountId.compareTo(convo.peerAccountId) > 0;
+    if (isFollower && !force) return true;
+    try {
+      const limit = Duration(seconds: 5);
+      final account = await _api.lookupAccount(convo.peerUsername).timeout(limit);
+      _recordPeerDisplayName(account);
+      final peers = account.devices;
+      if (peers.length > 1) return false;
+      if (peers.length == 1 && peers.single.deviceId != convo.peerDeviceId) {
+        return false;
+      }
+      final mine = await _deviceCache.fetchMyDevices().timeout(limit);
+      return mine.every((d) => d.deviceId == session.deviceId);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// A forced rebuild that lost the sibling election has already wiped this
+  /// device's group and dropped to ratchet, and nothing else would try again until
+  /// the user happened to send something. The elected sibling may be a closed web
+  /// tab or a phone that is off, so retry once the grace is up. If that sibling
+  /// did rebuild, the chat is on MLS by then and this does nothing.
+  void _retryForcedRebuildAfterGrace(
+      String convoId, String body, String pushKind) {
+    if (_forcedRebuildRetries.containsKey(convoId)) return;
+    _forcedRebuildRetries[convoId] = Timer(
+      siblingInitiatorGrace * 1.1,
+      () {
+        _forcedRebuildRetries.remove(convoId);
+        if (_byId[convoId]?.cryptoMode != CryptoMode.ratchet) return;
+        unawaited(_controlSender
+            .sendControl(convoId, body,
+                forceMigration: true, pushKind: pushKind)
+            .catchError((Object e) {
+          debugPrint('forced rebuild retry failed on $convoId: $e');
+        }));
+      },
+    );
   }
 
   /// Full multi-device MLS migration for a 1:1: builds a fresh MLS group whose
@@ -3988,8 +4200,8 @@ class ConversationsNotifier extends ChangeNotifier
     }
     if (peerPkgs.isEmpty) return null;
 
-    // Own other devices (self-sync). Best-effort — a failure just means our
-    // other devices join the group on their own next send instead of now.
+    // Own other devices (self-sync). Best-effort — a failure leaves them out for
+    // now, and the sweep [_noteGroupBuiltHere] starts adds them right after.
     var ownPkgs = const <DeviceKeyPackageResult>[];
     try {
       ownPkgs = (await _api.lookupDeviceKeyPackages(session.username))
@@ -4073,6 +4285,7 @@ class ConversationsNotifier extends ChangeNotifier
       await _db.deleteConversationCryptoState(convo.id);
     } catch (_) {/* none existed */}
     notifyListeners();
+    _noteGroupBuiltHere(convo.id);
 
     // 3. The application envelope — ONLY to devices that got their Welcome.
     SubmitMessageResult? firstOk;
@@ -4104,35 +4317,23 @@ class ConversationsNotifier extends ChangeNotifier
     return firstOk;
   }
 
-  Future<Set<String>?> _loadKnownOwnDevices() async {
-    try {
-      final raw = await _secureStorage.getString(knownOwnDevicesKey);
-      if (raw == null) return null;
-      return (jsonDecode(raw) as List).cast<String>().toSet();
-    } catch (_) {
-      return null;
+  /// Puts this account's devices back into every MLS conversation that is
+  /// missing them. Works from who is REALLY in each group rather than from a
+  /// remembered list of devices, so it repairs every way a device can get left
+  /// out: a rebuild that couldn't fetch its package, a device that was offline or
+  /// out of packages, or an adder that disappeared. Only ever adds OUR OWN
+  /// devices. Best-effort: whatever fails is found again by the next sweep.
+  ///
+  /// [maxRank] limits this pass to groups where this device is that far down the
+  /// order; the ones further down get their turn after [ownDeviceRankStep], unless
+  /// a device ahead of us has done the add by then.
+  Future<void> _reconcileOwnDevicesIntoGroups({int maxRank = 0}) async {
+    // Triggered from several places that can overlap. Two overlapping sweeps
+    // would both add the newcomer to the same group (forking it), so run one at a
+    // time and coalesce triggers that arrive meanwhile into a single follow-up.
+    if (maxRank > _ownDeviceReconcileAgainRank) {
+      _ownDeviceReconcileAgainRank = maxRank;
     }
-  }
-
-  Future<void> _saveKnownOwnDevices(Set<String> ids) async {
-    try {
-      await _secureStorage.putString(
-          knownOwnDevicesKey, jsonEncode(ids.toList()));
-    } catch (_) {/* best-effort */}
-  }
-
-  /// Detects a device freshly linked to THIS account and adds it to every
-  /// already-migrated MLS 1:1 group so it receives going forward (a 1:1 that
-  /// migrated before the link otherwise strands the new device — it never got a
-  /// Welcome). Exactly one EXISTING device does the adding — the lexically
-  /// device elected by AdderElection (the device that linked it, else the
-  /// smallest old id) — so two devices can't race to add the newcomer and
-  /// fork the group. Covers MLS 1:1s and MLS groups. Best-effort: a failure just retries on the next connect.
-  Future<void> _reconcileOwnDevicesIntoGroups() async {
-    // Triggered from connect() AND the live devices_changed signal, which can
-    // land while a sweep is already running. Two overlapping sweeps would both
-    // add the newcomer to the same group (forking it), so run one at a time and
-    // coalesce triggers that arrive meanwhile into a single follow-up pass.
     if (_ownDeviceReconcileRunning) {
       _ownDeviceReconcileAgain = true;
       return;
@@ -4141,7 +4342,9 @@ class ConversationsNotifier extends ChangeNotifier
     try {
       do {
         _ownDeviceReconcileAgain = false;
-        await _reconcileOwnDevicesIntoGroupsOnce();
+        final rank = _ownDeviceReconcileAgainRank;
+        _ownDeviceReconcileAgainRank = 0;
+        await _reconcileOwnDevicesIntoGroupsOnce(rank);
       } while (_ownDeviceReconcileAgain);
     } finally {
       _ownDeviceReconcileRunning = false;
@@ -4150,148 +4353,209 @@ class ConversationsNotifier extends ChangeNotifier
 
   bool _ownDeviceReconcileRunning = false;
   bool _ownDeviceReconcileAgain = false;
+  int _ownDeviceReconcileAgainRank = 0;
+  Timer? _ownDeviceRankTimer;
 
-  Future<void> _reconcileOwnDevicesIntoGroupsOnce() async {
+  /// How long each device waits per place in the order before adding a missing
+  /// device itself. Long enough for the Commit of the device ahead to arrive.
+  Duration ownDeviceRankStep = const Duration(seconds: 30);
+
+  /// Devices we couldn't add, and when to try again. Fetching packages burns one
+  /// of EVERY device on the account, so a device that has been off for a month, or
+  /// a connection dropping every few seconds, must not cost its siblings one per
+  /// sweep. Cleared when the server says the device list changed.
+  final Map<String, DateTime> _ownDeviceRetryAt = {};
+  final Map<String, int> _ownDeviceMisses = {};
+  Timer? _ownDeviceRetryTimer;
+
+  /// A device just linked publishes its packages a few seconds AFTER the server
+  /// announces it, so the first look usually finds none: try again soon, and
+  /// only back off for a device that stays without them (switched off for days).
+  List<Duration> ownDeviceNoPackageWaits = const [
+    Duration(minutes: 1),
+    Duration(minutes: 5),
+    Duration(minutes: 30),
+    Duration(hours: 1),
+  ];
+
+  void _ownDeviceNoPackage(String deviceId, DateTime now) {
+    final misses = _ownDeviceMisses[deviceId] ?? 0;
+    _ownDeviceMisses[deviceId] = misses + 1;
+    final wait = ownDeviceNoPackageWaits[
+        misses.clamp(0, ownDeviceNoPackageWaits.length - 1)];
+    _ownDeviceRetryAt[deviceId] = now.add(wait);
+    if (_ownDeviceRetryTimer != null) return;
+    _ownDeviceRetryTimer = Timer(wait, () {
+      _ownDeviceRetryTimer = null;
+      unawaited(_reconcileOwnDevicesIntoGroups());
+    });
+  }
+
+  /// Which of our devices each 1:1's group held at the last sweep. A device that
+  /// was out and is back (a rebuild left it out, then a later one put it back)
+  /// can't read anything sent in between, because those messages were sealed to
+  /// a group without it. Only one of our own devices can give it those.
+  final Map<String, Set<String>> _ownMembersSeen = {};
+  static const Duration _ownDeviceAddFailedWait = Duration(minutes: 10);
+
+  Future<void> _reconcileOwnDevicesIntoGroupsOnce(int maxRank) async {
     final session = await _sessions.current();
     if (session == null) return;
-    _deviceCache.clearMyDevices();
-    final List<Device> myDevices;
-    try {
-      myDevices = await _myDeviceList();
-    } catch (_) {
-      return;
-    }
-    if (myDevices.isEmpty) return;
-    final currentIds = myDevices.map((d) => d.deviceId).toSet();
-
-    final known = await _loadKnownOwnDevices();
-    if (known == null) {
-      // First observation — baseline only. Devices already present were added
-      // at migration time (or will be when a conversation first migrates);
-      // retro-adding them here would double-add and fork the group.
-      await _saveKnownOwnDevices(currentIds);
-      return;
-    }
-    final newIds = currentIds.difference(known)..remove(session.deviceId);
-    if (newIds.isEmpty) {
-      if (currentIds.length != known.length) {
-        await _saveKnownOwnDevices(currentIds);
-      }
-      return;
-    }
-    // Per new device, elect ONE existing device to add it (the device that
-    // linked it if still active, else the smallest old id) — see AdderElection.
-    // Every device computes the same answer from the same list. Devices we are
-    // not the adder for are just recorded as handled (the elected adder keeps
-    // its own pending state until its sweep fully succeeds).
-    final addIds = <String>{
-      for (final d in myDevices)
-        if (newIds.contains(d.deviceId) &&
-            AdderElection.adderFor(
-                    newDevice: d,
-                    activeDevices: myDevices,
-                    newDeviceIds: newIds) ==
-                session.deviceId)
-          d.deviceId,
-    };
-    if (addIds.isEmpty) {
-      await _saveKnownOwnDevices(currentIds); // not us — just rebaseline
-      return;
-    }
-    final deviceById = {for (final d in myDevices) d.deviceId: d};
-
-    // Add the new device(s) to each MLS 1:1. Fetch FRESH key packages PER
-    // CONVERSATION — an MLS key package is single-use, so reusing one across
-    // groups makes every Welcome after the first invalid (CoreCrypto rejects it
-    // with MlsArgumentException). A transient failure leaves `retryNeeded` set
-    // so we don't rebaseline and instead retry the whole sweep next connect.
-    final backfilled = await _loadBackfilledHistory();
-    final addedLog =
-        PersistedMarkerSet(storage: _secureStorage, key: ownDeviceAddedKey);
-    final added = await addedLog.load();
-    var retryNeeded = false;
+    final myDevices = await _myDeviceList();
+    if (myDevices.length < 2) return;
+    final now = DateTime.now();
+    int? nextRank;
     for (final convo in _byId.values.toList()) {
       if (convo.cryptoMode != CryptoMode.mls ||
           (convo.kind != ConversationKind.oneToOne &&
               convo.kind != ConversationKind.group)) {
         continue;
       }
-      // Skip the (single-use) key-package fetch when every device is already in.
-      if (addIds.every((id) => added.contains('$id|${convo.id}'))) continue;
-      final Map<String, List<int>> kpByDevice;
+      final Set<String> members;
       try {
-        final myKps = await _api.lookupDeviceKeyPackages(session.username);
-        kpByDevice = {for (final k in myKps) k.deviceId: k.keyPackage};
+        members = await _crypto.groupMemberDeviceIds(convo.id);
       } catch (e) {
-        debugPrint('reconcile: key-package fetch for ${convo.id} failed: $e');
-        retryNeeded = true;
+        // We hold no such group: the receive path owns that repair.
+        debugPrint('reconcile: no group members for ${convo.id}: $e');
         continue;
       }
-      for (final newId in addIds) {
-        if (added.contains('$newId|${convo.id}')) continue;
-        final kp = kpByDevice[newId];
-        if (kp == null) {
-          // It publishes ~100 packages right after linking; stay pending so a
-          // later connect / devices_changed retries instead of re-baselining.
-          retryNeeded = true;
-          continue;
-        }
-        try {
-          if (convo.kind == ConversationKind.group) {
-            await _groupManager.addOwnDeviceToGroup(
-                conversationId: convo.id,
-                newDevice: deviceById[newId]!,
-                keyPackage: kp);
-          } else {
-            await _addDeviceToOneToOneGroup(
-                convo.id, session.accountId, newId, kp);
-          }
-        } catch (e) {
-          debugPrint('reconcile: add $newId to ${convo.id} failed: $e');
-          retryNeeded = true;
-          continue;
-        }
-        added.add('$newId|${convo.id}');
-        await addedLog.save(added);
-        // The device is now an MLS member of this 1:1 — replay its recent
-        // history so a freshly-linked device isn't blank. Once per
-        // (device, convo); best-effort (a failure retries on a later sweep, and
-        // the receiver dedups so a re-send is harmless).
-        final marker = '$newId|${convo.id}';
-        if (!backfilled.contains(marker)) {
-          try {
-            await _backfillHistoryToDevice(convo.id, session.accountId, newId);
-            backfilled.add(marker);
-            await _saveBackfilledHistory(backfilled);
-          } catch (e) {
-            debugPrint('reconcile: backfill $newId for ${convo.id} failed: $e');
-          }
-        }
-        // Also hand the new device this chat's state (mute/pin/archive/timer/
-        // block/verified/background/read position). Best-effort; the existing
-        // retry/marker behaviour above is unaffected.
-        try {
-          await _stateSync.sendFullState(convo.id);
-        } catch (e) {
-          debugPrint('reconcile: state sync for ${convo.id} failed: $e');
-        }
+      await _replayToReturnedDevices(convo, session, myDevices, members);
+      final gap = OwnDeviceGapFinder.find(
+        memberDeviceIds: members,
+        myDevices: myDevices,
+        myDeviceId: session.deviceId,
+      );
+      if (gap == null) continue;
+      if (gap.rank > maxRank) {
+        if (nextRank == null || gap.rank < nextRank) nextRank = gap.rank;
+        continue;
       }
+      final wanted = [
+        for (final d in gap.missing)
+          if (!(_ownDeviceRetryAt[d.deviceId]?.isAfter(now) ?? false)) d,
+      ];
+      if (wanted.isEmpty) continue;
+      await _addOwnDevicesToConversation(convo, session, wanted, members, now);
     }
-    // Only rebaseline once the sweep fully succeeded — otherwise a missed add
-    // would become permanent (the device would never be seen as "new" again).
-    if (!retryNeeded) {
-      await _saveKnownOwnDevices(currentIds);
+    if (nextRank != null && _ownDeviceRankTimer == null) {
+      final rank = nextRank;
+      _ownDeviceRankTimer = Timer(ownDeviceRankStep * (rank - maxRank), () {
+        _ownDeviceRankTimer = null;
+        unawaited(_reconcileOwnDevicesIntoGroups(maxRank: rank));
+      });
     }
   }
 
-  /// Adds one of our OWN newly-linked devices to an existing MLS 1:1 group:
-  /// Welcome to the new device, Commit to every current member (peer devices +
-  /// our other old devices), so the newcomer joins at the post-add epoch.
+  Future<void> _addOwnDevicesToConversation(
+    Conversation convo,
+    JwtSession session,
+    List<Device> wanted,
+    Set<String> members,
+    DateTime now,
+  ) async {
+    // Fresh packages per conversation: a package is single-use, and reusing one
+    // makes every Welcome after the first invalid.
+    final Map<String, List<int>> kpByDevice;
+    try {
+      final myKps = await _api.lookupDeviceKeyPackages(session.username);
+      kpByDevice = {for (final k in myKps) k.deviceId: k.keyPackage};
+    } catch (e) {
+      // A bad connection, which is when rebuilds leave devices out: try again
+      // soon rather than at the next reconnect.
+      debugPrint('reconcile: key-package fetch for ${convo.id} failed: $e');
+      for (final d in wanted) {
+        _ownDeviceNoPackage(d.deviceId, now);
+      }
+      return;
+    }
+    for (final device in wanted) {
+      final kp = kpByDevice[device.deviceId];
+      if (kp == null) {
+        _ownDeviceNoPackage(device.deviceId, now);
+        continue;
+      }
+      try {
+        if (convo.kind == ConversationKind.group) {
+          await _groupManager.addOwnDeviceToGroup(
+              conversationId: convo.id, newDevice: device, keyPackage: kp);
+        } else {
+          await _addDeviceToOneToOneGroup(
+              convo.id, session.accountId, device.deviceId, kp, members);
+        }
+      } catch (e) {
+        debugPrint('reconcile: add ${device.deviceId} to ${convo.id} failed: $e');
+        _ownDeviceRetryAt[device.deviceId] = now.add(_ownDeviceAddFailedWait);
+        continue;
+      }
+      _ownMembersSeen[convo.id]?.add(device.deviceId);
+      _ownDeviceMisses.remove(device.deviceId);
+      await _backfillAddedDevice(convo.id, session.accountId, device.deviceId);
+      // Also hand the device this chat's state (mute/pin/archive/timer/block/
+      // verified/background/read position). Best-effort.
+      try {
+        await _stateSync.sendFullState(convo.id);
+      } catch (e) {
+        debugPrint('reconcile: state sync for ${convo.id} failed: $e');
+      }
+    }
+  }
+
+  /// Replays recent history to our devices that are back in [convo]'s group since
+  /// the last sweep. Only the lowest of our own members does it, so they don't
+  /// each send it. The receiver ignores messages it already has.
+  Future<void> _replayToReturnedDevices(Conversation convo, JwtSession session,
+      List<Device> myDevices, Set<String> members) async {
+    final ownNow = {
+      for (final d in myDevices)
+        if (members.contains(d.deviceId)) d.deviceId,
+    };
+    final before = _ownMembersSeen[convo.id];
+    _ownMembersSeen[convo.id] = ownNow;
+    if (before == null ||
+        convo.kind != ConversationKind.oneToOne ||
+        !ownNow.contains(session.deviceId)) {
+      return;
+    }
+    final returned = ownNow.difference(before)..remove(session.deviceId);
+    if (returned.isEmpty) return;
+    // Only a device that stayed in the group has what was sent meanwhile.
+    final stayed = ownNow.intersection(before).toList()..sort();
+    if (stayed.isEmpty || stayed.first != session.deviceId) return;
+    for (final id in returned) {
+      try {
+        await _backfillHistoryToDevice(convo.id, session.accountId, id);
+      } catch (e) {
+        debugPrint('reconcile: replay to returned $id on ${convo.id} failed: $e');
+      }
+    }
+  }
+
+  /// Replays recent history so a device that just joined isn't blank. Once per
+  /// (device, conversation). Best-effort: a failure retries the next time the
+  /// device is added, and the receiver dedups so a re-send is harmless.
+  Future<void> _backfillAddedDevice(
+      String conversationId, String myAccountId, String deviceId) async {
+    final backfilled = await _loadBackfilledHistory();
+    final marker = '$deviceId|$conversationId';
+    if (backfilled.contains(marker)) return;
+    try {
+      await _backfillHistoryToDevice(conversationId, myAccountId, deviceId);
+      backfilled.add(marker);
+      await _saveBackfilledHistory(backfilled);
+    } catch (e) {
+      debugPrint('reconcile: backfill $deviceId for $conversationId failed: $e');
+    }
+  }
+
+  /// Adds one of our OWN devices to an existing MLS 1:1 group: Welcome to the
+  /// device, Commit to every current member in [members], so the newcomer joins
+  /// at the post-add epoch.
   Future<void> _addDeviceToOneToOneGroup(
     String conversationId,
     String myAccountId,
     String newDeviceId,
     List<int> keyPackage,
+    Set<String> members,
   ) async {
     await _runLocked(conversationId, () async {
       final convo = _byId[conversationId];
@@ -4307,9 +4571,9 @@ class ConversationsNotifier extends ChangeNotifier
         ciphertext: r.welcome,
       ));
       // Commit to every existing member device (NOT the newcomer — it joins via
-      // the Welcome above).
-      final recipients = (await _mlsFanoutRecipients(convo))
-          .where((rc) => rc.deviceId != newDeviceId);
+      // the Welcome above). A device that isn't a member can't process a Commit.
+      final recipients = (await _mlsFanoutRecipients(convo)).where((rc) =>
+          rc.deviceId != newDeviceId && members.contains(rc.deviceId));
       for (final rc in recipients) {
         try {
           await _api.submitMessage(SubmitMessagePayload(
@@ -4365,7 +4629,9 @@ class ConversationsNotifier extends ChangeNotifier
     // still-local outbox / failed / uploading rows.
     final eligible = history
         .where((m) =>
-            m.outboxId == null &&
+            // A sent message keeps an EMPTY outbox id once the server has it;
+            // only a non-empty one is still waiting to go out.
+            (m.outboxId == null || m.outboxId!.isEmpty) &&
             !m.failed &&
             !m.uploading &&
             m.kind != MessageKind.system)
@@ -4439,6 +4705,7 @@ class ConversationsNotifier extends ChangeNotifier
         replyToSender: m.replyToSender,
         replyToPreview: m.replyToPreview,
         forwarded: m.forwarded,
+        clientMsgId: m.clientMsgId,
       );
 
   Future<Set<String>> _loadBackfilledHistory() async {
@@ -4588,7 +4855,8 @@ class ConversationsNotifier extends ChangeNotifier
     await _runLocked(
       receipt.conversationId,
       () => _receiptService.applyReceipt(receipt.conversationId, ReceiptKind.delivered,
-          [receipt.deliveredEnvelopeId]),
+          [receipt.deliveredEnvelopeId],
+          transportOnly: true),
     );
   }
 
@@ -4685,6 +4953,7 @@ class ConversationsNotifier extends ChangeNotifier
     if ((await _myDeviceList()).any((d) => d.deviceId != session.deviceId)) {
       return;
     }
+    if (!await _singlePeerMigrationIsSafe(convo)) return;
 
     await _runLocked(conversationId, () async {
       final live = _byId[conversationId];
@@ -4729,7 +4998,20 @@ class ConversationsNotifier extends ChangeNotifier
       await _db.upsertConversation(migrated);
       await _db.deleteConversationCryptoState(conversationId);
       notifyListeners();
+      _noteGroupBuiltHere(conversationId);
     });
+  }
+
+  /// This device just built [conversationId]'s group: older envelopes can't be
+  /// opened any more (see [GroupEstablishedLog]), and unconfirmed messages need
+  /// sending again. Local clock, as no server time exists yet; if it runs fast, a
+  /// few new failures skip one rebuild, and the resend sweep still covers them.
+  void _noteGroupBuiltHere(String conversationId) {
+    unawaited(_groupEstablished.mark(conversationId, DateTime.now().toUtc()));
+    _resender.onGroupChanged(conversationId);
+    // A rebuild can leave one of our devices out (its package fetch failed).
+    // Detached: callers hold this conversation's lock, which the add re-takes.
+    unawaited(Future(() => _reconcileOwnDevicesIntoGroups()));
   }
 
   /// Submits the same already-encrypted ciphertext to every [recipients] device
@@ -4851,6 +5133,10 @@ class ConversationsNotifier extends ChangeNotifier
           // Forced because the stranded side may be the migration FOLLOWER,
           // which the role rule would otherwise keep on ratchet.
           final lost = _byId[conversationId];
+          if (e is MlsUnknownGroupException &&
+              lost?.kind == ConversationKind.group) {
+            unawaited(_groupRecovery.requestRejoin(conversationId));
+          }
           if (!lostGroupRebuilt && lost != null && _isLostLocalMlsGroup(e, lost)) {
             lostGroupRebuilt = true;
             await _resetLostMlsGroup(lost);
@@ -4935,23 +5221,37 @@ class ConversationsNotifier extends ChangeNotifier
     // (each its own ratchet), bypassing the single-peer MlsMigrator path.
     // Single-device, groups, and MLS conversations keep the existing path.
     final SubmitMessageResult result;
-    final fanoutTargets =
-        (liveConvoAtSend.kind == ConversationKind.oneToOne &&
-                liveConvoAtSend.cryptoMode == CryptoMode.ratchet)
-            ? await _multiDeviceTargets(liveConvoAtSend)
-            : null;
-    if (fanoutTargets != null) {
-      // Multi-device 1:1 on ratchet: migrate the whole conversation to an
-      // MLS group that includes EVERY device of both accounts, so the
-      // message delivers to all of them (and stays delivered as MLS from
-      // here on). Falls back to per-device ratchet fan-out only when the
-      // peer hasn't published MLS key packages yet.
-      final mlsResult = await _migrateAllDevicesToMls(
-          liveConvoAtSend, wireBody,
+    final ratchetOneToOne = liveConvoAtSend.kind == ConversationKind.oneToOne &&
+        liveConvoAtSend.cryptoMode == CryptoMode.ratchet;
+    var fanoutTargets =
+        ratchetOneToOne ? await _multiDeviceTargets(liveConvoAtSend) : null;
+    // Anything short of a confirmed single-device chat takes the all-devices
+    // migration. If that can't run either, this send stays on ratchet.
+    var singlePeerAllowed = true;
+    if (ratchetOneToOne && fanoutTargets == null) {
+      singlePeerAllowed = await _singlePeerMigrationIsSafe(liveConvoAtSend,
           force: forceMigration);
-      result = mlsResult ??
-          await _ratchetCore.fanout(conversationId, wireBody, fanoutTargets,
-              selfAccountId: (await _sessions.current())?.accountId);
+      // The check refreshed both directories, so look again.
+      if (!singlePeerAllowed) {
+        fanoutTargets = await _multiDeviceTargets(liveConvoAtSend);
+      }
+    }
+    // Multi-device 1:1 on ratchet: migrate the whole conversation to an
+    // MLS group that includes EVERY device of both accounts, so the
+    // message delivers to all of them (and stays delivered as MLS from
+    // here on). Falls back to per-device ratchet fan-out only when the
+    // peer hasn't published MLS key packages yet.
+    final allDevicesResult =
+        ratchetOneToOne && (fanoutTargets != null || !singlePeerAllowed)
+            ? await _migrateAllDevicesToMls(liveConvoAtSend, wireBody,
+                force: forceMigration)
+            : null;
+    if (allDevicesResult != null) {
+      result = allDevicesResult;
+    } else if (fanoutTargets != null) {
+      result = await _ratchetCore.fanout(
+          conversationId, wireBody, fanoutTargets,
+          selfAccountId: (await _sessions.current())?.accountId);
     } else {
     // The ratchet callback captures the advanced state here but does NOT
     // persist it — persistence happens after a successful submit below,
@@ -4973,6 +5273,7 @@ class ConversationsNotifier extends ChangeNotifier
       convo: liveConvoAtSend,
       plaintext: utf8.encode(wireBody),
       forceMigration: forceMigration,
+      allowMigration: singlePeerAllowed,
     );
 
     // 1. Submit Welcome envelope FIRST when migrating.
@@ -5073,6 +5374,7 @@ class ConversationsNotifier extends ChangeNotifier
       await _db.upsertConversation(migratedConvo);
       await _db.deleteConversationCryptoState(conversationId);
       notifyListeners();
+      _noteGroupBuiltHere(conversationId);
     }
     } // end single-device / group / MLS path
 
@@ -5096,6 +5398,8 @@ class ConversationsNotifier extends ChangeNotifier
       envelopeId: result.envelopeId,
       serverTs: result.serverTs,
       outboxId: '',
+      // Kept so a later resend can carry the same `_cid` and the receiver dedups.
+      clientMsgId: pending.clientMsgId ?? outboxId,
       clearPendingUploadKey: true,
       // Expire our own copy on the same timer the recipient got (the TTL
       // we just sent), anchored to the server's authoritative timestamp.
@@ -5389,6 +5693,9 @@ class ConversationsNotifier extends ChangeNotifier
         // CoreCrypto doesn't know this group — flag for re-establishment.
         _byId[convo.id] = convo.copyWith(needsReestablishment: true);
         notifyListeners();
+        if (convo.kind == ConversationKind.group) {
+          unawaited(_groupRecovery.requestRejoin(convo.id));
+        }
         // Proactively heal a 1:1 we hold NO group for (typically after a
         // recovery-phrase restore wiped our MLS store). Without this we'd wait
         // for the peer's next message to fail to decrypt 3× before re-keying —
@@ -5674,6 +5981,16 @@ class ConversationsNotifier extends ChangeNotifier
     _wsSub?.cancel();
     _disappearingSweepTimer?.cancel();
     _catchupRetryTimer?.cancel();
+    _ownDeviceRetryTimer?.cancel();
+    _ownDeviceRankTimer?.cancel();
+    _resendSweepTimer?.cancel();
+    _resender.dispose();
+    _groupRecovery.dispose();
+    _mlsReceiver.dispose();
+    for (final timer in _forcedRebuildRetries.values) {
+      timer.cancel();
+    }
+    _forcedRebuildRetries.clear();
     _typingService.clear();
     _stateSync.dispose();
     _supervisorSub?.cancel();

@@ -415,6 +415,11 @@ class CryptoBridgeDart
           'CryptoBridgeDart does not implement MLS; use CryptoBridgeNative.');
 
   @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) =>
+      throw UnimplementedError(
+          'CryptoBridgeDart does not implement MLS; use CryptoBridgeNative.');
+
+  @override
   Future<List<int>> encrypt({
     required String groupId,
     required List<int> plaintext,

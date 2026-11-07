@@ -6,7 +6,9 @@ import com.wire.crypto.ClientId
 import com.wire.crypto.CONVERSATION_CONFIGURATION_DEFAULT
 import com.wire.crypto.CUSTOM_CONFIGURATION_DEFAULT
 import com.wire.crypto.ConversationId
+import com.wire.crypto.CoreCryptoException
 import com.wire.crypto.CredentialType
+import com.wire.crypto.MlsException
 import com.wire.crypto.toMLSKeyPackage
 import com.wire.crypto.toWelcome
 import io.flutter.plugin.common.MethodCall
@@ -472,6 +474,23 @@ class NanbCryptoChannel(private val context: Context) {
                     result.errorFor(e)
                 }
             }
+            "groupMembers" -> scope.launch {
+                try {
+                    val groupId = call.argument<String>("groupId")
+                        ?: return@launch result.errorFor(
+                            IllegalArgumentException("missing groupId")
+                        )
+                    val client = MlsClientHolder.get()
+                    // clientId = deviceId (see mlsClientInit), so each decodes to
+                    // the device id. Read-only, like conversationEpoch above.
+                    val members = client.getClientIds(
+                        ConversationId(groupId.encodeToByteArray()),
+                    )
+                    result.success(members.map { it.copyBytes().decodeToString() })
+                } catch (e: Throwable) {
+                    result.errorFor(e)
+                }
+            }
             "replaceGroup" -> scope.launch {
                 try {
                     val localGroupId = call.argument<String>("localGroupId")
@@ -509,19 +528,34 @@ class NanbCryptoChannel(private val context: Context) {
                     // every catchup, forever, leaving the user stuck on "You
                     // were removed from this group". Nothing to wipe is exactly
                     // the state processWelcomeMessage below wants.
-                    try {
-                        client.transaction { ctx ->
-                            ctx.wipeConversation(
-                                conversationId = ConversationId(localGroupId.encodeToByteArray()),
-                            )
-                        }
-                    } catch (_: Throwable) { /* no local group to replace */ }
-                    val newGroupId: ByteArray = client.transaction { ctx ->
+                    //
+                    // OPEN THE WELCOME FIRST. CoreCrypto decrypts it before it checks
+                    // for an existing group (crypto/src/mls/conversation/welcome.rs),
+                    // so "already exists" proves this Welcome is good and only then
+                    // do we wipe. Wiping first destroyed a healthy group whenever the
+                    // Welcome turned out to be built from a dead key package.
+                    suspend fun join(): ByteArray = client.transaction { ctx ->
                         val welcomeBundle = ctx.processWelcomeMessage(
                             welcomeMessage = foreignWelcome.toWelcome(),
                             customConfiguration = CUSTOM_CONFIGURATION_DEFAULT,
                         )
                         welcomeBundle.id.copyBytes()
+                    }
+                    val newGroupId: ByteArray = try {
+                        join()
+                    } catch (e: Throwable) {
+                        val alreadyExists = (e as? CoreCryptoException.Mls)?.mlsError is
+                            MlsException.ConversationAlreadyExists ||
+                            e.toString().contains("ConversationAlreadyExists")
+                        if (!alreadyExists) throw e
+                        try {
+                            client.transaction { ctx ->
+                                ctx.wipeConversation(
+                                    conversationId = ConversationId(localGroupId.encodeToByteArray()),
+                                )
+                            }
+                        } catch (_: Throwable) { /* no local group to replace */ }
+                        join()
                     }
                     result.success(String(newGroupId, Charsets.UTF_8))
                 } catch (e: Throwable) {

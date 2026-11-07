@@ -18,9 +18,11 @@ import '../models/system_event.dart';
 import 'control_sender.dart';
 import 'device_cache.dart';
 import 'envelope_retry_log.dart';
+import 'group_established_log.dart';
 import 'message_appender.dart';
 import 'notifier_service_host.dart';
 import 'processed_envelope_log.dart';
+import 'rebuild_throttle.dart';
 
 /// The MLS RECEIVE engine: process Welcomes (join/adopt/replace group, with the
 /// simultaneous-migration tiebreaker + orphan/poison handling), decrypt MLS
@@ -46,7 +48,19 @@ class MlsReceiver {
         peerAccountFromOneToOneId,
     required EnvelopeRetryLog retryLog,
     required ProcessedEnvelopeLog processedLog,
-  })  : _host = host,
+    void Function(String conversationId)? onGroupChanged,
+    GroupEstablishedLog? establishedLog,
+    RebuildThrottle? rebuildThrottle,
+    void Function()? onDeadWelcome,
+    void Function(String groupId)? onGroupLost,
+    void Function(String groupId)? onGroupJoined,
+  })  : _onGroupChanged = onGroupChanged,
+        _establishedLog = establishedLog,
+        _rebuildThrottle = rebuildThrottle,
+        _onDeadWelcome = onDeadWelcome,
+        _onGroupLost = onGroupLost,
+        _onGroupJoined = onGroupJoined,
+        _host = host,
         _retryLog = retryLog,
         _processedLog = processedLog,
         _crypto = crypto,
@@ -59,6 +73,22 @@ class MlsReceiver {
         _isUnknownPeerPlaceholder = isUnknownPeerPlaceholder,
         _recordPeerDisplayName = recordPeerDisplayName,
         _peerAccountFromOneToOneId = peerAccountFromOneToOneId;
+
+  /// Told when this device joined a 1:1's group from a Welcome, so it can re-send
+  /// what the peer never confirmed. See [UnconfirmedMessageResender].
+  final void Function(String conversationId)? _onGroupChanged;
+  final GroupEstablishedLog? _establishedLog;
+  final RebuildThrottle? _rebuildThrottle;
+
+  /// A Welcome couldn't be opened because its key package is dead, so the rest of
+  /// this device's published pool is suspect too.
+  final void Function()? _onDeadWelcome;
+
+  /// This device can't read a group any more and needs re-adding.
+  final void Function(String groupId)? _onGroupLost;
+
+  /// This device just joined a group from a Welcome.
+  final void Function(String groupId)? _onGroupJoined;
 
   final NotifierServiceHost _host;
   final CryptoBridge _crypto;
@@ -123,7 +153,6 @@ class MlsReceiver {
   final Map<String, DateTime> _lastPeerDirWarm = {};
 
   static const int _mlsReestablishThreshold = 3;
-  static const Duration _mlsReestablishCooldown = Duration(seconds: 45);
   static const Duration _mlsReestablishGrace = Duration(seconds: 6);
   static const int _maxUndecryptableRedeliveries = 5;
 
@@ -138,7 +167,53 @@ class MlsReceiver {
   /// otherwise wipe the fresh group and ship a second, competing Welcome.
   void noteLocalRebuild(String convoId) {
     _lastReestablish[convoId] = DateTime.now();
+    unawaited(_rebuildThrottle?.record(convoId));
     _mlsDecryptFailures.remove(convoId);
+  }
+
+  /// The leader rule is about the two ACCOUNTS: a Welcome from one of our own
+  /// devices IS the leader's group, and discarding it left this device on a dead
+  /// group, sending messages nobody could read. The one exception is two siblings
+  /// building at the same moment, where the lower device id wins so they can't
+  /// swap groups.
+  bool _keepsOwnGroupOverSibling(
+      String convoId, String myDeviceId, String siblingDeviceId) {
+    final builtAt = _lastReestablish[convoId];
+    if (builtAt == null) return false;
+    final recent =
+        DateTime.now().difference(builtAt) < _siblingBuildCollisionWindow;
+    return recent && myDeviceId.compareTo(siblingDeviceId) < 0;
+  }
+
+  static const Duration _siblingBuildCollisionWindow = Duration(minutes: 2);
+
+  /// Forced rebuilds the limiter refused, waiting to try again.
+  final Map<String, Timer> _forcedRetries = {};
+
+  /// A rebuild was needed but the limiter said not yet. If nothing retried, this
+  /// is a permanent stall: a peer that couldn't open our last Welcome asks once,
+  /// we refuse because we only just rebuilt, and both sides then wait forever. So
+  /// wait out the limit and go again, unless a message decrypts first, which
+  /// proves the group works and cancels this ([_cancelForcedRetry]).
+  void _retryForcedRebuildLater(String convoId, String senderDeviceId,
+      String myDeviceId, Duration wait) {
+    if (_forcedRetries.containsKey(convoId)) return;
+    _forcedRetries[convoId] = Timer(wait, () {
+      _forcedRetries.remove(convoId);
+      unawaited(maybeReestablish(convoId, senderDeviceId, myDeviceId,
+          force: true));
+    });
+  }
+
+  void _cancelForcedRetry(String convoId) =>
+      _forcedRetries.remove(convoId)?.cancel();
+
+  /// Cancels waiting retries. Call when the owner is torn down.
+  void dispose() {
+    for (final timer in _forcedRetries.values) {
+      timer.cancel();
+    }
+    _forcedRetries.clear();
   }
 
   /// Whether a failed Welcome adoption is PERMANENT for these bytes — i.e.
@@ -177,6 +252,17 @@ class MlsReceiver {
       );
       debugPrint('mls_welcome: adopted peer group on $convoId');
       _discardedWelcomes.remove(convoId);
+      await _noteJoined(env);
+      await _host.ack([env.envelopeId]);
+      return;
+    } on MlsOrphanWelcomeException catch (e) {
+      // Built from a key package we no longer hold, and nothing was touched by
+      // the attempt. Keep the group we have: a hard reset here would throw away a
+      // working group for a Welcome that can never open. Count it as discarded,
+      // which is what it is, so the next failure from this peer forces a repair.
+      debugPrint('mls_welcome: dead key package on $convoId ($e); keeping group');
+      _discardedWelcomes[convoId] = (_discardedWelcomes[convoId] ?? 0) + 1;
+      _onDeadWelcome?.call();
       await _host.ack([env.envelopeId]);
       return;
     } catch (e) {
@@ -195,6 +281,7 @@ class MlsReceiver {
     try {
       await _crypto.processWelcome(env.ciphertext);
       debugPrint('mls_welcome: adopted peer group on $convoId after hard reset');
+      await _noteJoined(env);
     } catch (e2) {
       debugPrint('mls_welcome: hard-reset adopt failed on $convoId ($e2); '
           'acking to drop poison');
@@ -280,9 +367,15 @@ class MlsReceiver {
         final leaderShouldYield =
             (hadDecryptFailures || roleRuleNotConverging) &&
                 !_reestablishing.contains(convoId);
+        final fromMyOtherDevice = await _deviceCache.isMyDeviceWarm(
+                env.senderDeviceId, myDeviceId) &&
+            env.senderDeviceId != myDeviceId;
         if (iAmFollower ||
             existing.pending ||
             leaderShouldYield ||
+            (fromMyOtherDevice &&
+                !_keepsOwnGroupOverSibling(
+                    convoId, myDeviceId, env.senderDeviceId)) ||
             (!roleKnown && (hasReceivedReal || hadDecryptFailures))) {
           await _adoptForeignWelcome(convoId, env);
           return;
@@ -338,6 +431,14 @@ class MlsReceiver {
       // ORPHAN — adopt the peer's Welcome via replaceGroup then fall through.
       // (b) Convo is already MLS: a genuine duplicate — ack idempotently.
       final ex = _host.conversation(convoId);
+      if (e is MlsOrphanWelcomeException && !convoId.startsWith('group:')) {
+        // Can never open, and nothing changed. Don't flip the 1:1 to a group we
+        // don't hold. The peer's next message drives the repair.
+        debugPrint('mls_welcome: dead key package on $convoId ($e)');
+        _onDeadWelcome?.call();
+        await _host.ack([env.envelopeId]);
+        return;
+      }
       String? adopted;
       if (ex == null || ex.cryptoMode != CryptoMode.mls) {
         try {
@@ -530,9 +631,29 @@ class MlsReceiver {
       await _host.db.upsertConversation(placeholder);
       _host.notifyHost();
     }
+    await _noteJoined(env);
     // The Welcome is consumed — ack so it never replays (a replayed Welcome
     // would hit the collision branch and could wipe the advanced group).
     await _host.ack([env.envelopeId]);
+  }
+
+  /// This device just joined a 1:1's group from the Welcome [env]. Anything older
+  /// than that Welcome was sealed to an earlier group: see [GroupEstablishedLog].
+  /// Uses the server's timestamps on both sides of the comparison, so a wrong
+  /// clock on this phone can't affect it.
+  Future<void> _noteJoined(wire.Envelope env) async {
+    await _establishedLog?.mark(env.conversationId, env.serverTs);
+    if (env.conversationId.startsWith('group:')) {
+      _onGroupJoined?.call(env.conversationId);
+    } else {
+      _onGroupChanged?.call(env.conversationId);
+    }
+  }
+
+  /// Whether [env] predates the group this device currently holds.
+  Future<bool> _predatesCurrentGroup(wire.Envelope env) async {
+    final established = await _establishedLog?.at(env.conversationId);
+    return established != null && env.serverTs.isBefore(established);
   }
 
   /// Decrypts an MLS application message + appends it (or handles self-removal /
@@ -612,6 +733,8 @@ class MlsReceiver {
       // the role rule is converging after all.
       _mlsDecryptFailures.remove(convoId);
       _discardedWelcomes.remove(convoId);
+      _cancelForcedRetry(convoId);
+      unawaited(_rebuildThrottle?.clear(convoId));
       unawaited(_retryLog.forget(env.envelopeId));
       // CoreCrypto has consumed this message's key: any redelivery can only
       // fail, so remember it (see the guard at the top of this method).
@@ -671,6 +794,11 @@ class MlsReceiver {
       // log + drop; common on replay, malformed payload, etc.
       // ignore: avoid_print
       print('mls_application decrypt error for convo $convoId: $e; dropping');
+      if (convo.kind == ConversationKind.group) {
+        await _onGroupDecryptFailure(env, e);
+        await _boundUndecryptableApp(env.envelopeId);
+        return;
+      }
       // Repeated failures from a real peer mean our group diverged (split
       // brain). Count the streak; on the threshold, kick off re-establishment.
       // Only a plausible PEER device drives this — an outsider spraying
@@ -693,7 +821,12 @@ class MlsReceiver {
         // they sent, while the peer's cooldown held back the second Welcome
         // that `_discardedWelcomes` needs to make it yield.
         final discardedTheirRebuild = (_discardedWelcomes[convoId] ?? 0) > 0;
-        if (e is MlsUnknownGroupException || discardedTheirRebuild) {
+        if (e is! MlsUnknownGroupException &&
+            await _predatesCurrentGroup(env)) {
+          // Sealed to a group we have since replaced, so this failure says
+          // nothing about the group we hold. Re-keying over it destroys a healthy
+          // group, and catching up after that rebuild then causes the next one.
+        } else if (e is MlsUnknownGroupException || discardedTheirRebuild) {
           unawaited(Future(() => maybeReestablish(
               convoId, env.senderDeviceId, myDeviceId,
               force: true)));
@@ -707,6 +840,38 @@ class MlsReceiver {
       // ...and bound this envelope's redelivery (sealed to a dead epoch).
       await _boundUndecryptableApp(env.envelopeId);
     }
+  }
+
+  /// A peer told us over ratchet it can't use our group. Detached, as this runs
+  /// inside the conversation lock and a rebuild takes it. Ignored for a chat not on
+  /// MLS, or a request older than the group we hold: that group already answers it,
+  /// and honoring it would tear down a working group during a catchup.
+  void onRebuildRequested(wire.Envelope env, String myDeviceId) {
+    unawaited(Future(() async {
+      final convo = _host.conversation(env.conversationId);
+      if (convo == null ||
+          convo.kind != ConversationKind.oneToOne ||
+          convo.cryptoMode != CryptoMode.mls ||
+          await _predatesCurrentGroup(env)) {
+        return;
+      }
+      await maybeReestablish(env.conversationId, env.senderDeviceId, myDeviceId,
+          force: true);
+    }));
+  }
+
+  /// A group can't be rebuilt the way a 1:1 can, so this device asks to be re-added:
+  /// at once when it holds no group, or after a streak of failures on messages
+  /// newer than the group it joined.
+  Future<void> _onGroupDecryptFailure(wire.Envelope env, Object e) async {
+    final convoId = env.conversationId;
+    if (e is! MlsUnknownGroupException) {
+      if (await _predatesCurrentGroup(env)) return;
+      final streak = (_mlsDecryptFailures[convoId] ?? 0) + 1;
+      _mlsDecryptFailures[convoId] = streak;
+      if (streak < _mlsReestablishThreshold) return;
+    }
+    _onGroupLost?.call(convoId);
   }
 
   /// Processes an MLS handshake message so CoreCrypto's group state advances.
@@ -762,9 +927,12 @@ class MlsReceiver {
 
     if ((_mlsDecryptFailures[convoId] ?? 0) < _mlsReestablishThreshold) return;
     if (_reestablishing.contains(convoId)) return;
-    final last = _lastReestablish[convoId];
-    if (last != null &&
-        DateTime.now().difference(last) < _mlsReestablishCooldown) {
+    final throttle = _rebuildThrottle;
+    final wait = await throttle?.remainingWait(convoId) ?? Duration.zero;
+    if (wait > Duration.zero) {
+      if (force) {
+        _retryForcedRebuildLater(convoId, senderDeviceId, myDeviceId, wait);
+      }
       return;
     }
     // Use the convo's primary peer device id (stable) for ordering when known.
@@ -803,6 +971,8 @@ class MlsReceiver {
     _reestablishing.add(convoId);
     final startedAt = DateTime.now();
     _lastReestablish[convoId] = startedAt;
+    _cancelForcedRetry(convoId);
+    await throttle?.record(convoId);
     _mlsDecryptFailures[convoId] = 0;
     try {
       // Wipe the diverged local group and flip the convo back to ratchet so the
@@ -844,9 +1014,10 @@ class MlsReceiver {
       // delete + re-contact. Unknown account ids keep the old forced rebuild.
       final roleKnown = myAccountId.isNotEmpty && peerAccountId.isNotEmpty;
       final iAmFollower = roleKnown && waitsForPeer;
+      // To every peer device: it's lost if the only one it reaches is switched off.
       await _controlSender.sendControl(
           convoId, const MessageControl.reestablish().encode(),
-          forceMigration: !iAmFollower);
+          forceMigration: !iAmFollower, allPeerDevices: true);
     } catch (e) {
       debugPrint('mls re-establish failed on $convoId: $e');
     } finally {

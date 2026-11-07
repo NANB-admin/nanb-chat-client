@@ -20,6 +20,7 @@ class DeviceCache {
   final Map<String, List<AccountDevice>> _peerDevices = {};
   List<Device>? _myDevicesCache;
   DateTime? _myDevicesFetchedAt;
+  int _myDevicesGeneration = 0;
 
   /// The cached peer device list for [accountId] (empty if unknown).
   List<AccountDevice> peerDevices(String accountId) =>
@@ -65,13 +66,25 @@ class DeviceCache {
     final cached = _myDevicesCache;
     if (cached != null && !myDevicesStale(now: now)) return cached;
     try {
-      final devs = await _api.listDevices();
-      _myDevicesCache = devs;
-      _myDevicesFetchedAt = now ?? DateTime.now();
-      return devs;
+      return await fetchMyDevices(now: now);
     } catch (_) {
       return cached ?? const [];
     }
+  }
+
+  /// Fetches this account's devices now and caches them. Unlike [myDevices] it
+  /// THROWS when the fetch fails, for callers that must tell "I have no other
+  /// devices" from "I couldn't find out".
+  Future<List<Device>> fetchMyDevices({DateTime? now}) async {
+    final generation = _myDevicesGeneration;
+    final devs = await _api.listDevices();
+    // A clear while this was in flight means the list may already be out of date
+    // (a device was just linked). Don't put it back.
+    if (generation == _myDevicesGeneration) {
+      _myDevicesCache = devs;
+      _myDevicesFetchedAt = now ?? DateTime.now();
+    }
+    return devs;
   }
 
   /// Synchronous peek at the own-device cache (empty if not yet loaded).
@@ -79,12 +92,14 @@ class DeviceCache {
 
   /// Drop + reload the own-device cache (after a device-link change / cold miss).
   Future<void> refreshMyDevices() async {
+    _myDevicesGeneration++;
     _myDevicesCache = null;
     await myDevices();
   }
 
   /// Invalidate the own-device cache without reloading.
   void clearMyDevices() {
+    _myDevicesGeneration++;
     _myDevicesCache = null;
     _myDevicesFetchedAt = null;
   }

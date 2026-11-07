@@ -290,8 +290,22 @@ class _FakeSupervisor extends ChangeNotifier implements WsReconnectSupervisor {
 }
 
 class _PassthroughCrypto implements CryptoBridge, SealOpener {
+  /// Who CoreCrypto says is in any group. Empty means this device isn't a member.
+  Set<String> memberDeviceIds = const {};
+
   @override
-  Future<bool> consumeMlsStoreReset() async => false;
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async =>
+      memberDeviceIds;
+
+  @override
+  Future<bool> consumeMlsStoreReset() async {
+    final was = storeResetPending;
+    storeResetPending = false;
+    return was;
+  }
+
+  /// What the next [consumeMlsStoreReset] reports.
+  bool storeResetPending = false;
 
   /// Sealed-sender (Phase 1): what [openSealed] returns. Defaults to echoing the
   /// input, so a test can push a sealed envelope whose ciphertext is already the
@@ -368,6 +382,9 @@ class _PassthroughCrypto implements CryptoBridge, SealOpener {
     );
   }
 
+  /// When set, where a decrypt leaves the receive chain.
+  int? ratchetRecvCounter;
+
   @override
   Future<DecryptResult> decryptMessage({
     required ConversationCryptoState state,
@@ -376,7 +393,8 @@ class _PassthroughCrypto implements CryptoBridge, SealOpener {
     decryptCalls++;
     return DecryptResult(
       plaintext: List<int>.from(ciphertext),
-      newState: state.copyWith(recvCounter: state.recvCounter + 1),
+      newState: state.copyWith(
+          recvCounter: ratchetRecvCounter ?? state.recvCounter + 1),
     );
   }
 
@@ -637,6 +655,7 @@ Envelope _envelope({
   String senderDeviceId = 'peer-dev',
   String envelopeType = EnvelopeType.mlsApplication,
   List<int> ciphertext = const [104, 105], // "hi"
+  DateTime? serverTs,
 }) {
   return Envelope(
     envelopeId: envelopeId,
@@ -648,7 +667,7 @@ Envelope _envelope({
     recipientAccountId: 'me-acc',
     recipientDeviceId: _myDeviceId,
     ciphertext: ciphertext,
-    serverTs: DateTime.utc(2026, 5, 7, 12),
+    serverTs: serverTs ?? DateTime.utc(2026, 5, 7, 12),
   );
 }
 
@@ -808,6 +827,11 @@ void main() {
     notifier = buildNotifier();
     when(() => api.catchupMessages(since: any(named: 'since'), limit: any(named: 'limit')))
         .thenAnswer((_) async => <Envelope>[]);
+    // Default: the directory confirms one device on each side, which is what
+    // lets the single-peer migration run. Multi-device tests override these.
+    when(() => api.lookupAccount(any()))
+        .thenAnswer((_) async => _peerAccount());
+    when(() => api.listDevices()).thenAnswer((_) async => const <Device>[]);
     // Default: peer has no KeyPackage available → MlsMigrator stays on ratchet.
     // Tests that exercise MLS migration override this stub explicitly.
     when(() => api.lookupKeyPackage(any()))
@@ -1648,6 +1672,51 @@ void main() {
       expect(m1.serverTs.isBefore(m2.serverTs), isTrue);
       final loaded = await db.loadMessages(convoId, limit: 50);
       expect(loaded.map((m) => m.envelopeId), containsAll(['hist-1', 'hist-2']));
+    });
+
+    test('skips a replayed message it already has under another envelope id',
+        () async {
+      await connectWithKnownDevices();
+      final convoId = seedMlsConvoBf();
+      notifier.seed(notifier.byId(convoId)!.copyWith(messages: [
+        ChatMessage(
+          envelopeId: 'my-copy',
+          conversationId: convoId,
+          senderDeviceId: 'peer-dev',
+          body: 'already here',
+          serverTs: DateTime.utc(2026, 11, 7),
+          mine: false,
+          clientMsgId: 'cid-1',
+        ),
+      ]));
+      final payload = HistoryBackfill(
+        conversationId: convoId,
+        seq: 1,
+        total: 1,
+        messages: const [
+          BackfillMessage(
+            envelopeId: 'siblings-copy',
+            serverTsMs: 1762473600000,
+            senderDeviceId: 'peer-dev',
+            mine: false,
+            kind: MessageKind.text,
+            body: 'already here',
+            clientMsgId: 'cid-1',
+          ),
+        ],
+      ).encode();
+
+      ws.push(_envelope(
+        envelopeId: 'carrier-dup',
+        conversationId: convoId,
+        senderDeviceId: 'me-dev-2',
+        envelopeType: EnvelopeType.mlsApplication,
+        ciphertext: utf8.encode(payload),
+      ));
+      await pumpEventQueue();
+
+      expect(notifier.byId(convoId)!.messages.where((m) => m.body == 'already here'),
+          hasLength(1));
     });
 
     test('follower (larger account) ADOPTS a Welcome rather than winning the '
@@ -5065,6 +5134,92 @@ void main() {
       return convoId;
     }
 
+    group('when the directory cannot confirm a single device', () {
+      late List<SubmitMessagePayload> sent;
+
+      Future<String> startChat({String rowDevice = 'peer-dev'}) async {
+        await sessions.save(session);
+        await notifier.connect();
+        sent = [];
+        when(() => api.submitMessage(any())).thenAnswer((inv) async {
+          sent.add(inv.positionalArguments.first as SubmitMessagePayload);
+          return SubmitMessageResult(
+              envelopeId: 'srv-\${sent.length}', serverTs: DateTime.utc(2026));
+        });
+        when(() => api.lookupKeyPackage(any())).thenAnswer(
+          (_) async => FetchKeyPackageResult(
+            keyPackage: List<int>.filled(64, 0xBB),
+            replenishNeeded: false,
+            remainingForUser: 9,
+          ),
+        );
+        when(() => api.lookupAccount(_peerUsername)).thenAnswer((_) async => Account(
+              accountId: _peerAccountId,
+              username: _peerUsername,
+              identityPubKey: const [9, 8, 7],
+              x25519PubKey: const [1, 2, 3],
+              deviceId: rowDevice,
+              devices: const [
+                AccountDevice(deviceId: 'peer-dev', x25519PubKey: [1, 2, 3]),
+              ],
+            ));
+        return notifier.startConversation(
+          myDeviceId: _myDeviceId,
+          username: _peerUsername,
+        );
+      }
+
+      Iterable<String> welcomed() => sent
+          .where((p) => p.envelopeType == EnvelopeType.mlsWelcome)
+          .map((p) => p.recipientDeviceId);
+
+      test('a failed own-device lookup builds no one-device group', () async {
+        final convoId = await startChat();
+        when(() => api.listDevices()).thenThrow(Exception('offline'));
+
+        await notifier.sendMessage(
+            conversationId: convoId, myDeviceId: _myDeviceId, text: 'hi');
+        await pumpEventQueue();
+
+        expect(welcomed(), isEmpty);
+      });
+
+      test('the message still goes out on ratchet', () async {
+        final convoId = await startChat();
+        when(() => api.listDevices()).thenThrow(Exception('offline'));
+
+        await notifier.sendMessage(
+            conversationId: convoId, myDeviceId: _myDeviceId, text: 'hi');
+        await pumpEventQueue();
+
+        expect(sent.map((p) => p.envelopeType), [EnvelopeType.textLegacy]);
+      });
+
+      test('a row pointing at an old device invites the real one', () async {
+        final convoId = await startChat(rowDevice: 'peer-old');
+        when(() => api.lookupDeviceKeyPackages(_peerUsername))
+            .thenAnswer((_) async => const [
+                  DeviceKeyPackageResult(deviceId: 'peer-dev', keyPackage: [1]),
+                ]);
+
+        await notifier.sendMessage(
+            conversationId: convoId, myDeviceId: _myDeviceId, text: 'hi');
+        await pumpEventQueue();
+
+        expect(welcomed(), ['peer-dev']);
+      });
+
+      test('a confirmed single device still takes the simple path', () async {
+        final convoId = await startChat();
+
+        await notifier.sendMessage(
+            conversationId: convoId, myDeviceId: _myDeviceId, text: 'hi');
+        await pumpEventQueue();
+
+        verifyNever(() => api.lookupDeviceKeyPackages(any()));
+      });
+    });
+
     test('a sibling device with a smaller id starts the MLS group, not this one',
         () async {
       final convoId = await startFirstContactWithSibling('a-dev');
@@ -5367,13 +5522,67 @@ void main() {
       });
     });
 
+    group('a chat started on our other device', () {
+      late String convoId;
+
+      setUp(() async {
+        await sessions.save(session);
+        when(() => api.listDevices()).thenAnswer((_) async => [
+              const Device(
+                  deviceId: _myDeviceId, accountId: 'me-acc', devicePubKey: []),
+              const Device(
+                  deviceId: 'me-dev-2',
+                  accountId: 'me-acc',
+                  devicePubKey: [],
+                  x25519PubKey: [7, 7, 7]),
+            ]);
+        when(() => api.lookupAccountById(_peerAccountId))
+            .thenAnswer((_) async => _peerAccount());
+        when(() => api.ackMessages(any())).thenAnswer((_) async => 1);
+        await notifier.connect();
+        await pumpEventQueue();
+        convoId = Conversation.oneToOneId('me-acc', _peerAccountId);
+      });
+
+      void pushFromSibling(String body, String envelopeId) => ws.push(_envelope(
+            conversationId: convoId,
+            envelopeType: EnvelopeType.textLegacy,
+            senderDeviceId: 'me-dev-2',
+            envelopeId: envelopeId,
+            ciphertext: utf8.encode(body),
+          ));
+
+      test('shows its first message here, as ours', () async {
+        pushFromSibling('hi from my other phone', 'sib-1');
+        await pumpEventQueue(times: 50);
+
+        final msgs = notifier.byId(convoId)!.messages;
+        expect(msgs.where((m) => m.body == 'hi from my other phone' && m.mine),
+            hasLength(1));
+      });
+
+      test('is not listed as a request', () async {
+        pushFromSibling('hi from my other phone', 'sib-2');
+        await pumpEventQueue(times: 50);
+
+        expect(notifier.byId(convoId)!.pending, isFalse);
+      });
+
+      test('control traffic for a chat we deleted still creates nothing',
+          () async {
+        pushFromSibling(
+            MessageControl.receipt(ReceiptKind.read, const ['x']).encode(),
+            'sib-3');
+        await pumpEventQueue(times: 50);
+
+        expect(notifier.byId(convoId), isNull);
+      });
+    });
+
     test('a newly-linked own device is added to existing MLS 1:1 groups',
         () async {
       await sessions.save(session);
-      // Baseline: we previously knew only our own primary device, so me-dev-2
-      // (appearing below) is genuinely new.
-      await storage.putString(
-          ConversationsNotifier.knownOwnDevicesKey, jsonEncode([_myDeviceId]));
+      crypto.memberDeviceIds = {_myDeviceId, 'peer-dev'};
       // An MLS 1:1 already exists with the peer (migrated before the link).
       final convoId = Conversation.oneToOneId('me-acc', _peerAccountId);
       notifier.seed(Conversation(
@@ -5426,8 +5635,7 @@ void main() {
         'a devices_changed frame adds a device linked while already connected, '
         'without a reconnect', () async {
       await sessions.save(session);
-      await storage.putString(
-          ConversationsNotifier.knownOwnDevicesKey, jsonEncode([_myDeviceId]));
+      crypto.memberDeviceIds = {_myDeviceId, 'peer-dev'};
       notifier.seed(Conversation(
         id: Conversation.oneToOneId('me-acc', _peerAccountId),
         peerUsername: _peerUsername,
@@ -5489,8 +5697,7 @@ void main() {
       // new device must get a DISTINCT package per group — a reused one makes
       // the 2nd Welcome invalid (the bug this guards against).
       await sessions.save(session);
-      await storage.putString(
-          ConversationsNotifier.knownOwnDevicesKey, jsonEncode([_myDeviceId]));
+      crypto.memberDeviceIds = {_myDeviceId, 'peer-dev'};
       for (final p in const [
         (acc: _peerAccountId, user: _peerUsername, dev: 'peer-dev'),
         (acc: 'peer2-acc', user: 'peer2', dev: 'peer2-dev'),
@@ -5740,6 +5947,89 @@ void main() {
       final loaded = await db.loadConversations();
       final dbConvo = loaded.firstWhere((c) => c.id == convoId);
       expect(dbConvo.cryptoMode, equals(CryptoMode.mls));
+    });
+
+    test('a Welcome from our own other device replaces our group', () async {
+      // The leader rule is about accounts. Discarding this one left a device on
+      // a dead group, sending messages nobody could read.
+      when(() => api.listDevices()).thenAnswer((_) async => const [
+            Device(deviceId: _myDeviceId, accountId: 'me-acc', devicePubKey: []),
+            Device(deviceId: 'me-dev-2', accountId: 'me-acc', devicePubKey: []),
+          ]);
+      await sessions.save(session);
+      await notifier.connect();
+      await pumpEventQueue();
+      final convoId = seedMlsConvo();
+
+      ws.push(_envelope(
+        conversationId: convoId,
+        envelopeType: EnvelopeType.mlsWelcome,
+        senderDeviceId: 'me-dev-2',
+        ciphertext: const [1, 2, 3],
+      ));
+      await pumpEventQueue();
+
+      expect(crypto.replaceGroupCalls.map((c) => c.localGroupId), [convoId]);
+    });
+
+    test("a ratchet message from the peer's other device is delivered", () async {
+      when(() => api.lookupAccount(_peerUsername)).thenAnswer((_) async => Account(
+            accountId: _peerAccountId,
+            username: _peerUsername,
+            identityPubKey: const [9, 8, 7],
+            x25519PubKey: const [1, 2, 3],
+            deviceId: 'peer-dev',
+            devices: const [
+              AccountDevice(deviceId: 'peer-dev', x25519PubKey: [1, 2, 3]),
+              AccountDevice(deviceId: 'peer-dev-2', x25519PubKey: [4, 5, 6]),
+            ],
+          ));
+      await sessions.save(session);
+      await notifier.connect();
+      await pumpEventQueue();
+      final convoId = seedMlsConvo();
+
+      ws.push(_envelope(
+        conversationId: convoId,
+        envelopeType: EnvelopeType.textLegacy,
+        senderDeviceId: 'peer-dev-2',
+        envelopeId: 'other-device-1',
+        ciphertext: utf8.encode('from their other phone'),
+      ));
+      await pumpEventQueue(times: 100);
+
+      expect(notifier.byId(convoId)!.messages.map((m) => m.body),
+          contains('from their other phone'));
+    });
+
+    test("a ratchet message from the peer's other device forces no rebuild",
+        () async {
+      when(() => api.lookupAccount(_peerUsername)).thenAnswer((_) async => Account(
+            accountId: _peerAccountId,
+            username: _peerUsername,
+            identityPubKey: const [9, 8, 7],
+            x25519PubKey: const [1, 2, 3],
+            deviceId: 'peer-dev',
+            devices: const [
+              AccountDevice(deviceId: 'peer-dev', x25519PubKey: [1, 2, 3]),
+              AccountDevice(deviceId: 'peer-dev-2', x25519PubKey: [4, 5, 6]),
+            ],
+          ));
+      await sessions.save(session);
+      await notifier.connect();
+      await pumpEventQueue();
+      final convoId = seedMlsConvo();
+
+      ws.push(_envelope(
+        conversationId: convoId,
+        envelopeType: EnvelopeType.textLegacy,
+        senderDeviceId: 'peer-dev-2',
+        envelopeId: 'other-device-2',
+        ciphertext: utf8.encode('still in touch'),
+      ));
+      await pumpEventQueue(times: 100);
+
+      expect(notifier.byId(convoId)!.cryptoMode, CryptoMode.mls);
     });
 
     test('inbound_mls_welcome_MlsConvo_IsIdempotent', () async {
@@ -7176,6 +7466,540 @@ void main() {
       expect(msgs.single.body, equals('hello world'),
           reason: 'the `_cid` header is stripped from the rendered body');
       expect(msgs.single.clientMsgId, equals('outbox-1'));
+    });
+
+    group('at-least-once delivery', () {
+      // The peer's account sorts BEFORE ours: we are the follower and adopt.
+      const followerPeerAccount = 'aaa-acc';
+      const convoId = '1to1:aaa-acc:me-acc';
+      // The peer's account sorts AFTER ours: we are the leader and rebuild.
+      const leaderPeerAccount = 'zzz-acc';
+      const leaderConvoId = '1to1:me-acc:zzz-acc';
+
+      Future<void> seedMlsChat({
+        List<ChatMessage> messages = const [],
+        String id = convoId,
+        String peerAccountId = followerPeerAccount,
+      }) async {
+        await sessions.save(session);
+        await notifier.connect();
+        when(() => api.ackMessages(any())).thenAnswer((_) async => 1);
+        when(() => api.lookupAccount(_peerUsername))
+            .thenAnswer((_) async => _peerAccount());
+        when(() => api.submitMessage(any())).thenAnswer((_) async =>
+            SubmitMessageResult(
+                envelopeId: 'srv-env', serverTs: DateTime.utc(2026)));
+        notifier.resendSettleDelay = Duration.zero;
+        notifier.seed(Conversation(
+          id: id,
+          peerUsername: _peerUsername,
+          peerAccountId: peerAccountId,
+          peerDeviceId: 'peer-dev',
+          peerIdentityPubKey: const [9, 8, 7],
+          peerX25519PubKey: const [1, 2, 3],
+          messages: messages,
+          unreadCount: 0,
+          cryptoMode: CryptoMode.mls,
+        ));
+      }
+
+      ChatMessage unconfirmed() => ChatMessage(
+            envelopeId: 'sent-1',
+            conversationId: convoId,
+            senderDeviceId: _myDeviceId,
+            clientMsgId: 'cid-1',
+            body: 'are you there',
+            serverTs: DateTime.now().toUtc(),
+            mine: true,
+          );
+
+      List<String> submittedBodies() =>
+          verify(() => api.submitMessage(captureAny()))
+              .captured
+              .cast<SubmitMessagePayload>()
+              .map((p) => utf8.decode(p.ciphertext, allowMalformed: true))
+              .toList();
+
+      Future<void> adoptPeerWelcome() async {
+        ws.push(_envelope(
+          envelopeId: 'welcome-1',
+          conversationId: convoId,
+          senderDeviceId: 'peer-dev',
+          envelopeType: EnvelopeType.mlsWelcome,
+        ));
+        await pumpEventQueue();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        await pumpEventQueue();
+      }
+
+      Future<void> receiveRebuildRequest({DateTime? serverTs}) async {
+        await seedMlsChat(id: leaderConvoId, peerAccountId: leaderPeerAccount);
+        when(() => api.lookupKeyPackage(any())).thenAnswer((_) async =>
+            FetchKeyPackageResult(
+                keyPackage: List<int>.filled(64, 0xBB),
+                replenishNeeded: false,
+                remainingForUser: 9));
+        // Well along its chain, so only the request itself can explain a rebuild.
+        crypto.ratchetRecvCounter = 7;
+        ws.push(_envelope(
+          envelopeId: 'request',
+          conversationId: leaderConvoId,
+          senderDeviceId: 'peer-dev',
+          envelopeType: EnvelopeType.textLegacy,
+          ciphertext:
+              utf8.encode(const MessageControl.reestablish().encode()),
+          serverTs: serverTs,
+        ));
+        await pumpEventQueue();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        await pumpEventQueue();
+      }
+
+      test('a rebuild request over ratchet makes the leader rebuild', () async {
+        // It may be the only signal: a follower holding a dead Welcome has
+        // nothing else it can send, and no later message would be read as one.
+        await receiveRebuildRequest();
+
+        expect(crypto.wipeGroupCalls, greaterThan(0));
+      });
+
+      Future<int> rebuildsAfterASecondRequest({required bool decryptOk}) async {
+        await sessions.save(session);
+        await notifier.connect();
+        when(() => api.ackMessages(any())).thenAnswer((_) async => 1);
+        when(() => api.lookupAccount(_peerUsername))
+            .thenAnswer((_) async => _peerAccount());
+        when(() => api.lookupKeyPackage(any())).thenAnswer((_) async =>
+            FetchKeyPackageResult(
+                keyPackage: List<int>.filled(64, 0xBB),
+                replenishNeeded: false,
+                remainingForUser: 9));
+        when(() => api.submitMessage(any())).thenAnswer((_) async =>
+            SubmitMessageResult(
+                envelopeId: 'srv-env', serverTs: DateTime.utc(2026)));
+        notifier.rebuildWaits = const [Duration(milliseconds: 200)];
+        notifier.seed(Conversation(
+          id: leaderConvoId,
+          peerUsername: _peerUsername,
+          peerAccountId: leaderPeerAccount,
+          peerDeviceId: 'peer-dev',
+          peerIdentityPubKey: const [9, 8, 7],
+          peerX25519PubKey: const [1, 2, 3],
+          messages: const [],
+          unreadCount: 0,
+          cryptoMode: CryptoMode.mls,
+        ));
+        // The peer's first request: we rebuild, and the limit starts running.
+        crypto.decryptAndInspectError =
+            const MlsUnknownGroupException('no group');
+        ws.push(_envelope(
+            envelopeId: 'first',
+            conversationId: leaderConvoId,
+            senderDeviceId: 'peer-dev'));
+        await pumpEventQueue();
+        // It couldn't open that Welcome and asks again, inside the limit.
+        ws.push(_envelope(
+          envelopeId: 'second',
+          conversationId: leaderConvoId,
+          senderDeviceId: 'peer-dev',
+          envelopeType: EnvelopeType.mlsApplication,
+        ));
+        await pumpEventQueue();
+        final before = crypto.wipeGroupCalls;
+        if (decryptOk) {
+          // The group turns out to work after all.
+          crypto.decryptAndInspectError = null;
+          ws.push(_envelope(
+            envelopeId: 'works',
+            conversationId: leaderConvoId,
+            senderDeviceId: 'peer-dev',
+          ));
+          await pumpEventQueue();
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 350));
+        await pumpEventQueue();
+        return crypto.wipeGroupCalls - before;
+      }
+
+      test('a forced rebuild refused by the limit retries when it can', () async {
+        // Otherwise a peer holding a dead Welcome waits forever.
+        expect(await rebuildsAfterASecondRequest(decryptOk: false), greaterThan(0));
+      });
+
+      test('a decrypted message cancels the waiting rebuild', () async {
+        expect(await rebuildsAfterASecondRequest(decryptOk: true), 0);
+      });
+
+      test('a Welcome with a dead key package does not wipe the group', () async {
+        // It can never open, and the group we hold still works.
+        await seedMlsChat();
+        crypto.replaceGroupError =
+            const MlsOrphanWelcomeException('no matching key package');
+
+        await adoptPeerWelcome();
+
+        expect(crypto.wipeGroupCalls, 0);
+      });
+
+      test('a Welcome with a dead key package is acked', () async {
+        await seedMlsChat();
+        crypto.replaceGroupError =
+            const MlsOrphanWelcomeException('no matching key package');
+
+        await adoptPeerWelcome();
+
+        verify(() => api.ackMessages(['welcome-1'])).called(1);
+      });
+
+      test('a Welcome with a dead key package replaces the published pool',
+          () async {
+        await seedMlsChat();
+        crypto.replaceGroupError =
+            const MlsOrphanWelcomeException('no matching key package');
+        when(() => api.publishKeyPackages(any(), reset: true))
+            .thenAnswer((_) async => 1);
+
+        await adoptPeerWelcome();
+
+        verify(() => api.publishKeyPackages(any(), reset: true)).called(1);
+      });
+
+      test('a message older than the joined group does not trigger a rebuild',
+          () async {
+        // Sealed to the group we just replaced: it can never open, and that says
+        // nothing about the group we hold. Rebuilding over it re-keys the chat.
+        await seedMlsChat();
+        ws.push(_envelope(
+          envelopeId: 'welcome-new',
+          conversationId: convoId,
+          senderDeviceId: 'peer-dev',
+          envelopeType: EnvelopeType.mlsWelcome,
+          serverTs: DateTime.utc(2026, 6, 2),
+        ));
+        await pumpEventQueue();
+        crypto.decryptAndInspectError = const MlsArgumentException('old epoch');
+
+        for (var i = 0; i < 4; i++) {
+          ws.push(_envelope(
+            envelopeId: 'old-$i',
+            conversationId: convoId,
+            senderDeviceId: 'peer-dev',
+            serverTs: DateTime.utc(2026, 6, 1),
+          ));
+          await pumpEventQueue();
+        }
+        await Future<void>.delayed(const Duration(seconds: 7));
+        await pumpEventQueue();
+
+        expect(crypto.wipeGroupCalls, 0);
+      });
+
+      test('a message newer than the joined group still counts as a failure',
+          () async {
+        await seedMlsChat();
+        ws.push(_envelope(
+          envelopeId: 'welcome-new',
+          conversationId: convoId,
+          senderDeviceId: 'peer-dev',
+          envelopeType: EnvelopeType.mlsWelcome,
+          serverTs: DateTime.utc(2026, 6, 2),
+        ));
+        await pumpEventQueue();
+        crypto.decryptAndInspectError = const MlsArgumentException('broken');
+
+        for (var i = 0; i < 4; i++) {
+          ws.push(_envelope(
+            envelopeId: 'new-$i',
+            conversationId: convoId,
+            senderDeviceId: 'peer-dev',
+            serverTs: DateTime.utc(2026, 6, 3),
+          ));
+          await pumpEventQueue();
+        }
+        await Future<void>.delayed(const Duration(seconds: 7));
+        await pumpEventQueue();
+
+        expect(crypto.wipeGroupCalls, greaterThan(0));
+      });
+
+      test('a reconnect re-sends a message unconfirmed past the first wait',
+          () async {
+        await seedMlsChat(messages: [
+          unconfirmed().copyWith(
+            serverTs: DateTime.now().toUtc().subtract(const Duration(hours: 1)),
+          ),
+        ]);
+
+        supervisor.emitReconnected();
+        await pumpEventQueue();
+
+        expect(submittedBodies().where((b) => b.contains('"_cid":"cid-1"')),
+            isNotEmpty);
+      });
+
+      test('a sent message keeps its client id once the server accepts it',
+          () async {
+        await sessions.save(session);
+        await notifier.connect();
+        when(() => api.lookupAccount(_peerUsername))
+            .thenAnswer((_) async => _peerAccount());
+        when(() => api.submitMessage(any())).thenAnswer((_) async =>
+            SubmitMessageResult(
+                envelopeId: 'srv-env', serverTs: DateTime.utc(2026)));
+        final id = await notifier.startConversation(
+          myDeviceId: _myDeviceId,
+          username: _peerUsername,
+        );
+
+        await notifier.sendMessage(
+            conversationId: id, myDeviceId: _myDeviceId, text: 'hi');
+
+        expect(notifier.byId(id)!.messages.single.clientMsgId, isNotNull);
+      });
+
+      test('adopting a Welcome re-sends a message the peer never confirmed',
+          () async {
+        await seedMlsChat(messages: [unconfirmed()]);
+
+        await adoptPeerWelcome();
+
+        expect(submittedBodies().where((b) => b.contains('"_cid":"cid-1"')),
+            isNotEmpty);
+      });
+
+      test('a delivered tick from the transport does not stop the resend',
+          () async {
+        // The iOS extension acknowledges a push before decrypting anything, so
+        // this is exactly what a phone that lost its group sends back.
+        await seedMlsChat(messages: [unconfirmed()]);
+        ws.push(_envelope(
+          conversationId: convoId,
+          senderDeviceId: 'peer-dev',
+          envelopeType: EnvelopeType.deliveryStatus,
+          ciphertext: utf8.encode('sent-1'),
+        ));
+        await pumpEventQueue();
+
+        await adoptPeerWelcome();
+
+        expect(submittedBodies().where((b) => b.contains('"_cid":"cid-1"')),
+            isNotEmpty);
+      });
+
+      test('an end-to-end receipt stops the resend', () async {
+        await seedMlsChat(messages: [unconfirmed()]);
+        ws.push(_envelope(
+          envelopeId: 'receipt-1',
+          conversationId: convoId,
+          senderDeviceId: 'peer-dev',
+          envelopeType: EnvelopeType.mlsApplication,
+          ciphertext: utf8.encode(
+              MessageControl.receipt(ReceiptKind.delivered, ['cid-1']).encode()),
+        ));
+        await pumpEventQueue();
+
+        await adoptPeerWelcome();
+
+        verifyNever(() => api.submitMessage(any()));
+      });
+
+      test('the delivered receipt names the client id as well', () async {
+        await seedMlsChat();
+
+        ws.push(_envelope(
+          envelopeId: 'in-1',
+          conversationId: convoId,
+          senderDeviceId: 'peer-dev',
+          envelopeType: EnvelopeType.mlsApplication,
+          ciphertext: utf8.encode('{"_cid":"peer-cid"}\nhello'),
+        ));
+        await pumpEventQueue();
+
+        expect(
+            submittedBodies().where(
+                (b) => b.contains('"in-1"') && b.contains('"peer-cid"')),
+            isNotEmpty);
+      });
+
+      test('a duplicate message is confirmed again', () async {
+        // Otherwise a sender whose first receipt was lost keeps resending.
+        await seedMlsChat();
+        final wire = utf8.encode('{"_cid":"peer-cid"}\nhello');
+        ws.push(_envelope(
+          envelopeId: 'in-1',
+          conversationId: convoId,
+          senderDeviceId: 'peer-dev',
+          envelopeType: EnvelopeType.mlsApplication,
+          ciphertext: wire,
+        ));
+        await pumpEventQueue();
+        clearInteractions(api);
+        when(() => api.submitMessage(any())).thenAnswer((_) async =>
+            SubmitMessageResult(
+                envelopeId: 'srv-env', serverTs: DateTime.utc(2026)));
+
+        ws.push(_envelope(
+          envelopeId: 'in-1-resend',
+          conversationId: convoId,
+          senderDeviceId: 'peer-dev',
+          envelopeType: EnvelopeType.mlsApplication,
+          ciphertext: wire,
+        ));
+        await pumpEventQueue();
+
+        expect(
+            submittedBodies().where(
+                (b) => b.contains('"in-1-resend"') && b.contains('"peer-cid"')),
+            isNotEmpty);
+      });
+
+      test('an undecryptable envelope is not dropped before the fifth catchup',
+          () async {
+        // Each drain used to count it twice, destroying it on the third.
+        await seedMlsChat();
+        crypto.decryptAndInspectError = const MlsArgumentException('bad epoch');
+        when(() => api.catchupMessages(
+            since: any(named: 'since'),
+            limit: any(named: 'limit'))).thenAnswer((_) async => [
+              _envelope(
+                  envelopeId: 'poison',
+                  conversationId: convoId,
+                  senderDeviceId: 'peer-dev'),
+            ]);
+
+        for (var i = 0; i < 4; i++) {
+          supervisor.emitReconnected();
+          await pumpEventQueue();
+        }
+
+        verifyNever(() => api.ackMessages(['poison']));
+      });
+
+      test('an undecryptable envelope is dropped on the fifth catchup',
+          () async {
+        await seedMlsChat();
+        crypto.decryptAndInspectError = const MlsArgumentException('bad epoch');
+        when(() => api.catchupMessages(
+            since: any(named: 'since'),
+            limit: any(named: 'limit'))).thenAnswer((_) async => [
+              _envelope(
+                  envelopeId: 'poison',
+                  conversationId: convoId,
+                  senderDeviceId: 'peer-dev'),
+            ]);
+
+        for (var i = 0; i < 5; i++) {
+          supervisor.emitReconnected();
+          await pumpEventQueue();
+        }
+
+        verify(() => api.ackMessages(['poison'])).called(1);
+      });
+
+      test('a rebuilt store replaces its key packages before the catchup',
+          () async {
+        // The catchup is what makes a peer rebuild the chat; a Welcome built from
+        // a package of the destroyed store can never be opened.
+        await seedMlsChat();
+        final calls = <String>[];
+        crypto.storeResetPending = true;
+        when(() => api.publishKeyPackages(any(), reset: true))
+            .thenAnswer((_) async {
+          calls.add('replace');
+          return 1;
+        });
+        when(() => api.catchupMessages(
+            since: any(named: 'since'),
+            limit: any(named: 'limit'))).thenAnswer((_) async {
+          calls.add('catchup');
+          return const [];
+        });
+
+        supervisor.emitReconnected();
+        await pumpEventQueue();
+
+        expect(calls.first, 'replace');
+        expect(calls, contains('catchup'));
+      });
+
+      Future<void> losesGroupWithElectedSibling() async {
+        // Before connect: the own-device list is cached there.
+        when(() => api.listDevices()).thenAnswer((_) async => [
+              const Device(
+                  deviceId: _myDeviceId,
+                  accountId: 'me-acc',
+                  devicePubKey: []),
+              const Device(
+                  deviceId: 'a-dev',
+                  accountId: 'me-acc',
+                  devicePubKey: [],
+                  x25519PubKey: [7, 7, 7]),
+            ]);
+        await seedMlsChat(id: leaderConvoId, peerAccountId: leaderPeerAccount);
+        when(() => api.lookupAccount(_peerUsername)).thenAnswer((_) async =>
+            const Account(
+              accountId: leaderPeerAccount,
+              username: _peerUsername,
+              identityPubKey: [9, 8, 7],
+              x25519PubKey: [1, 2, 3],
+              deviceId: 'peer-dev',
+              devices: [
+                AccountDevice(deviceId: 'peer-dev', x25519PubKey: [1, 2, 3]),
+              ],
+            ));
+        when(() => api.lookupDeviceKeyPackages(_peerUsername))
+            .thenAnswer((_) async => const [
+                  DeviceKeyPackageResult(deviceId: 'peer-dev', keyPackage: [1]),
+                ]);
+        when(() => api.lookupDeviceKeyPackages('me'))
+            .thenAnswer((_) async => const [
+                  DeviceKeyPackageResult(deviceId: 'a-dev', keyPackage: [3]),
+                ]);
+        notifier.siblingInitiatorGrace = const Duration(milliseconds: 50);
+        crypto.decryptAndInspectError =
+            const MlsUnknownGroupException('no group');
+        ws.push(_envelope(
+          envelopeId: 'poison',
+          conversationId: leaderConvoId,
+          senderDeviceId: 'peer-dev',
+        ));
+        await pumpEventQueue();
+      }
+
+      Iterable<SubmitMessagePayload> submittedWelcomes() =>
+          verify(() => api.submitMessage(captureAny()))
+              .captured
+              .cast<SubmitMessagePayload>()
+              .where((p) => p.envelopeType == EnvelopeType.mlsWelcome);
+
+      test('a forced rebuild refused by the election retries after the grace',
+          () async {
+        // The elected sibling can be a closed web tab, so nothing else would
+        // rebuild the chat until the user happened to send something.
+        await losesGroupWithElectedSibling();
+
+        await Future<void>.delayed(const Duration(milliseconds: 700));
+        await pumpEventQueue();
+
+        expect(submittedWelcomes(), isNotEmpty);
+      });
+
+      test('the retry stands down if the elected sibling rebuilt first',
+          () async {
+        await losesGroupWithElectedSibling();
+        ws.push(_envelope(
+          envelopeId: 'sibling-welcome',
+          conversationId: leaderConvoId,
+          senderDeviceId: 'a-dev',
+          envelopeType: EnvelopeType.mlsWelcome,
+        ));
+        await pumpEventQueue();
+
+        await Future<void>.delayed(const Duration(milliseconds: 700));
+        await pumpEventQueue();
+
+        expect(submittedWelcomes(), isEmpty);
+      });
     });
 
     test('inbound message with JSON that lacks _system key stays kind=text', () async {

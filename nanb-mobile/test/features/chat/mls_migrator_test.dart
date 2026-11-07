@@ -21,6 +21,9 @@ import 'package:nanb_chat/features/chat/models/crypto_mode.dart';
 /// All other methods throw [UnsupportedError].
 class _RecordingBridge implements CryptoBridge {
   @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async => const {};
+
+  @override
   Future<bool> consumeMlsStoreReset() async => false;
 
   final List<String> calls = [];

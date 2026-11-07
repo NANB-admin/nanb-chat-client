@@ -176,6 +176,10 @@ class CryptoBridgeComposite
   Future<int> currentEpoch(String groupId) => mls.currentEpoch(groupId);
 
   @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) =>
+      mls.groupMemberDeviceIds(groupId);
+
+  @override
   Future<List<int>> encrypt({
     required String groupId,
     required List<int> plaintext,

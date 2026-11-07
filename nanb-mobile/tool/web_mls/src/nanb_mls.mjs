@@ -3,7 +3,7 @@
 // booleans, Uint8Array, arrays and plain objects cross the boundary.
 // Semantics mirror nanb_crypto/android (NanbCryptoChannel.kt, MlsClientHolder.kt).
 import * as CC from "@wireapp/core-crypto/src/corecrypto.js";
-import { NanbMlsArgumentError, toNanbError } from "./errors.mjs";
+import { NanbMlsArgumentError, isConversationAlreadyExists, toNanbError } from "./errors.mjs";
 import { createSerialQueue } from "./serial_queue.mjs";
 
 const { CoreCrypto, ClientId, ConversationId, DatabaseKey, Ciphersuite, CredentialType, Welcome, initWasmModule } = CC;
@@ -235,6 +235,11 @@ const impl = {
     needString(groupId, "groupId");
     return client().conversationEpoch(cid(groupId));
   },
+  async groupMembers(groupId) {
+    needString(groupId, "groupId");
+    const ids = await client().getClientIds(cid(groupId));
+    return ids.map((id) => dec.decode(id.copyBytes()));
+  },
   async encrypt(groupId, plaintext) {
     needString(groupId, "groupId");
     need(plaintext instanceof Uint8Array, "missing plaintext");
@@ -262,7 +267,14 @@ const impl = {
   async replaceGroup(localGroupId, foreignWelcome) {
     needString(localGroupId, "localGroupId");
     needBytes(foreignWelcome, "foreignWelcome");
-    // Best-effort wipe in its OWN transaction (see NanbCryptoChannel.kt).
+    // Open the Welcome FIRST; only "already exists" proves it's good enough to
+    // wipe for (see NanbCryptoChannel.kt).
+    try {
+      return await impl.processWelcome(foreignWelcome);
+    } catch (e) {
+      if (!isConversationAlreadyExists(e)) throw e;
+    }
+    // Best-effort wipe in its OWN transaction.
     try {
       await client().transaction((c) => c.wipeConversation(cid(localGroupId)));
     } catch (_) {

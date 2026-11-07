@@ -1,11 +1,13 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:nanb_chat/core/db/app_database.dart';
+import 'package:nanb_chat/core/secure_storage/secure_storage.dart';
 import 'package:nanb_chat/features/chat/models/chat_message.dart';
 import 'package:nanb_chat/features/chat/models/conversation.dart';
 import 'package:nanb_chat/features/chat/models/message_control.dart';
 import 'package:nanb_chat/features/chat/models/message_kind.dart';
 import 'package:nanb_chat/features/chat/services/notifier_service_host.dart';
 import 'package:nanb_chat/features/chat/services/receipt_service.dart';
+import 'package:nanb_chat/features/chat/services/transport_receipt_log.dart';
 
 const _convoId = '1to1:me:bob';
 
@@ -47,7 +49,7 @@ class _FakeHost implements NotifierServiceHost {
       super.noSuchMethod(invocation);
 }
 
-ChatMessage _mine() => ChatMessage(
+ChatMessage _mine({String? clientMsgId}) => ChatMessage(
       envelopeId: 'env-1',
       conversationId: _convoId,
       senderDeviceId: 'dev-me',
@@ -55,6 +57,7 @@ ChatMessage _mine() => ChatMessage(
       serverTs: DateTime.utc(2026, 1, 1),
       mine: true,
       kind: MessageKind.text,
+      clientMsgId: clientMsgId,
     );
 
 _FakeHost _hostWith(ChatMessage m) => _FakeHost(Conversation(
@@ -112,6 +115,66 @@ void main() {
       await _apply(host, ReceiptKind.delivered);
 
       expect(host.convo!.messages.single.readAt, readAt);
+    });
+
+    test('a receipt can name the message by its client message id', () async {
+      // A fan-out mints one envelope id per device and the sender keeps only
+      // one, so the client id is the only name that survives a resend.
+      final host = _hostWith(_mine(clientMsgId: 'cid-1'));
+
+      await ReceiptService(host)
+          .applyReceipt(_convoId, ReceiptKind.delivered, ['cid-1']);
+
+      expect(host.convo!.messages.single.deliveryStatus,
+          MessageDeliveryStatus.delivered);
+    });
+
+    test('a transport-only receipt still shows the message as delivered',
+        () async {
+      final host = _hostWith(_mine());
+      final log = TransportReceiptLog(storage: SecureStorageInMemory());
+
+      await ReceiptService(host, transportReceipts: log).applyReceipt(
+          _convoId, ReceiptKind.delivered, ['env-1'],
+          transportOnly: true);
+
+      expect(host.convo!.messages.single.deliveryStatus,
+          MessageDeliveryStatus.delivered);
+    });
+
+    test('a transport-only receipt is remembered as unconfirmed', () async {
+      final host = _hostWith(_mine());
+      final log = TransportReceiptLog(storage: SecureStorageInMemory());
+
+      await ReceiptService(host, transportReceipts: log).applyReceipt(
+          _convoId, ReceiptKind.delivered, ['env-1'],
+          transportOnly: true);
+
+      expect(await log.contains('env-1'), isTrue);
+    });
+
+    test('an end-to-end receipt clears the unconfirmed mark', () async {
+      final host = _hostWith(_mine());
+      final log = TransportReceiptLog(storage: SecureStorageInMemory());
+      final service = ReceiptService(host, transportReceipts: log);
+      await service.applyReceipt(_convoId, ReceiptKind.delivered, ['env-1'],
+          transportOnly: true);
+
+      await service.applyReceipt(_convoId, ReceiptKind.delivered, ['env-1']);
+
+      expect(await log.contains('env-1'), isFalse);
+    });
+
+    test('a late transport receipt does not undo an end-to-end one', () async {
+      final host = _hostWith(_mine());
+      final log = TransportReceiptLog(storage: SecureStorageInMemory());
+      final service = ReceiptService(host, transportReceipts: log);
+      await service.applyReceipt(_convoId, ReceiptKind.delivered, ['env-1']);
+
+      await service.applyReceipt(_convoId, ReceiptKind.delivered, ['env-1'],
+          transportOnly: true);
+
+      expect(await log.contains('env-1'), isFalse);
     });
 
     test('persists the times', () async {

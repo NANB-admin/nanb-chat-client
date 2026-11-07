@@ -440,7 +440,6 @@ class GroupManager {
           convo.cryptoMode != CryptoMode.mls) {
         return;
       }
-      if (convo.members.any((m) => m.deviceId == newDevice.deviceId)) return;
       final session = await _sessions.current();
       if (session == null) return;
       final selfRows =
@@ -477,7 +476,7 @@ class GroupManager {
       }
 
       final updatedMembers = [
-        ...convo.members,
+        ...convo.members.where((m) => m.deviceId != newDevice.deviceId),
         GroupMember(
           accountId: session.accountId,
           username: self.username,

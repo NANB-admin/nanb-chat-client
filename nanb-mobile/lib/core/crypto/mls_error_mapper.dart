@@ -30,6 +30,8 @@ class MlsErrorMapper {
         return MlsIoException(message);
       case 'mls_invalid_argument':
         return MlsArgumentException(message);
+      case 'mls_orphan_welcome':
+        return MlsOrphanWelcomeException(message);
       default:
         return MlsUnknownException(code, message);
     }

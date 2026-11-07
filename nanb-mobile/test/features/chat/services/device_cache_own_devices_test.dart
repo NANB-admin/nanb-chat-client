@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mocktail/mocktail.dart';
 
@@ -18,6 +20,25 @@ void main() {
   setUp(() {
     api = _MockApi();
     cache = DeviceCache(api: api);
+  });
+
+  test('fetchMyDevices reports a failed lookup instead of an empty list',
+      () async {
+    when(() => api.listDevices()).thenThrow(Exception('offline'));
+
+    expect(cache.fetchMyDevices(now: t0), throwsException);
+  });
+
+  test('a fetch started before a clear does not refill the cache', () async {
+    final slow = Completer<List<Device>>();
+    when(() => api.listDevices()).thenAnswer((_) => slow.future);
+    final inFlight = cache.myDevices(now: t0);
+
+    cache.clearMyDevices();
+    slow.complete([_device('old-list')]);
+    await inFlight;
+
+    expect(cache.myDevicesSync(), isEmpty);
   });
 
   test('the first call fetches the own device list', () async {

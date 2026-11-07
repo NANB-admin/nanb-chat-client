@@ -163,7 +163,12 @@ class RatchetReceiver {
   Future<void> _onTextLegacyForMlsConvo(
       Conversation convo, wire.Envelope env, String myDeviceId) async {
     final late = await _decryptOnFreshRatchet(convo, env);
-    final peerRestartedRatchet = late == null || late.newState.recvCounter <= 1;
+    // Counter evidence only means something for the primary device. Another
+    // device sending its first ratchet message hasn't restarted anything: it just
+    // isn't in the group yet, and its own account's devices add it.
+    final fromPrimary = env.senderDeviceId == convo.peerDeviceId;
+    final peerRestartedRatchet =
+        late == null || (fromPrimary && late.newState.recvCounter <= 1);
     if (peerRestartedRatchet) {
       // ignore: avoid_print
       print('inbound text_legacy for mls-mode convo ${convo.id}; '
@@ -184,20 +189,26 @@ class RatchetReceiver {
     );
   }
 
-  /// Decrypts [env] from the primary peer on a chain re-derived from the
-  /// peer's X25519 key, WITHOUT touching any stored state (an MLS-mode 1:1
-  /// keeps none). Null when the sender isn't the primary peer device, no key is
-  /// known, or it doesn't open.
+  /// Decrypts [env] on a chain re-derived from the SENDING device's X25519 key,
+  /// WITHOUT touching any stored state (an MLS-mode 1:1 keeps none). A device left
+  /// out of the group can only reach us this way, so limiting this to the primary
+  /// device lost every message sent from the others. Self-authenticating: it only
+  /// opens for the holder of a key the directory lists for that device. Null when
+  /// no key is known or it doesn't open.
   Future<DecryptResult?> _decryptOnFreshRatchet(
       Conversation convo, wire.Envelope env) async {
-    if (env.senderDeviceId != convo.peerDeviceId ||
-        convo.peerX25519PubKey.isEmpty) {
-      return null;
+    var senderKey = env.senderDeviceId == convo.peerDeviceId
+        ? convo.peerX25519PubKey
+        : _deviceCache.x25519ForSender(convo, env.senderDeviceId);
+    if (senderKey.isEmpty) {
+      await _warmDeviceCaches(convo);
+      senderKey = _deviceCache.x25519ForSender(convo, env.senderDeviceId);
     }
+    if (senderKey.isEmpty) return null;
     try {
       final fresh = await _crypto.initConversationCrypto(
         conversationId: convo.id,
-        peerX25519PubKey: convo.peerX25519PubKey,
+        peerX25519PubKey: senderKey,
       );
       return await _crypto.decryptMessage(
         state: fresh,

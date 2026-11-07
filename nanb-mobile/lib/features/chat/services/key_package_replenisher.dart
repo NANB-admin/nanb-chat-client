@@ -50,18 +50,7 @@ class KeyPackageReplenisher {
       // until all ~100 are burnt one failed invitation at a time. `reset: true`
       // makes the server DROP them; publishing more would not help, because
       // PopOne is FIFO and hands out the dead ones first.
-      await _hydratePendingReset();
-      if (await _crypto.consumeMlsStoreReset()) {
-        await _setPendingReset(true);
-      }
-      if (_pendingResetPublish) {
-        final fresh = await _crypto.mintKeyPackages(count: _refillSize);
-        await _api.publishKeyPackages(fresh, reset: true);
-        // Only now: the native flag is one-shot, so clearing before the
-        // publish landed would strand the device on a dead pool forever.
-        await _setPendingReset(false);
-        return;
-      }
+      if (await _replacePoolIfStoreWasReset()) return;
       final remaining = await _api.keyPackageCount();
       if (remaining >= _lowWaterMark) return;
       final kps = await _crypto.mintKeyPackages(count: _refillSize);
@@ -71,6 +60,68 @@ class KeyPackageReplenisher {
       print(
           'KeyPackage replenishment failed: $e — will retry on next foreground');
     }
+  }
+
+  /// A peer's Welcome turned out to be built from a package this device can no
+  /// longer open, so treat the published pool as dead and replace it. This repairs
+  /// a store reset whose one-shot native flag never reached the replacing publish.
+  /// At most one replacement per [_deadPoolCooldown].
+  Future<void> replaceSuspectPool() async {
+    final now = DateTime.now();
+    final last = _lastSuspectReplace;
+    if (last != null && now.difference(last) < _deadPoolCooldown) return;
+    _lastSuspectReplace = now;
+    try {
+      await _setPendingReset(true);
+      await _replacePoolIfStoreWasReset();
+    } catch (e) {
+      // ignore: avoid_print
+      print('KeyPackage replacement failed: $e — will retry on next foreground');
+    }
+  }
+
+  DateTime? _lastSuspectReplace;
+  static const Duration _deadPoolCooldown = Duration(minutes: 10);
+
+  /// Replaces the pool if the local store was rebuilt, and does nothing else. Run
+  /// this BEFORE draining a catchup: that drain is what makes a peer rebuild the
+  /// chat, and every Welcome it builds from the old pool can never be opened.
+  Future<void> replaceIfStoreWasReset() async {
+    try {
+      await _replacePoolIfStoreWasReset();
+    } catch (e) {
+      // ignore: avoid_print
+      print('KeyPackage replacement failed: $e — will retry on next foreground');
+    }
+  }
+
+  /// True when it replaced the pool. Throws if the publish fails, leaving the
+  /// marker set so the next attempt retries.
+  ///
+  /// Single-flight: a resume and a reconnect can both land here, and a second
+  /// publish would throw away the packages the first just uploaded.
+  Future<bool> _replacePoolIfStoreWasReset() {
+    final running = _replacing;
+    if (running != null) return running;
+    final started = _replaceOnce().whenComplete(() => _replacing = null);
+    _replacing = started;
+    return started;
+  }
+
+  Future<bool>? _replacing;
+
+  Future<bool> _replaceOnce() async {
+    await _hydratePendingReset();
+    if (await _crypto.consumeMlsStoreReset()) {
+      await _setPendingReset(true);
+    }
+    if (!_pendingResetPublish) return false;
+    final fresh = await _crypto.mintKeyPackages(count: _refillSize);
+    await _api.publishKeyPackages(fresh, reset: true);
+    // Only now: the native flag is one-shot, so clearing before the publish
+    // landed would strand the device on a dead pool forever.
+    await _setPendingReset(false);
+    return true;
   }
 
   /// Reads the persisted marker once per process.

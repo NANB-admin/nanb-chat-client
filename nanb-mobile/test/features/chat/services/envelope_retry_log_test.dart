@@ -11,6 +11,26 @@ void main() {
       expect(await log.recordFailure('env-1'), 2);
     });
 
+    test('counts an envelope once per delivery pass', () async {
+      // The receiver and the catchup backstop both report the same undecryptable
+      // envelope. Counting both burned the budget twice as fast, so a message
+      // was destroyed on the third reconnect instead of the fifth.
+      final log = EnvelopeRetryLog(storage: SecureStorageInMemory());
+      log.beginPass();
+      await log.recordFailure('env-1');
+
+      expect(await log.recordFailure('env-1'), 1);
+    });
+
+    test('counts an envelope again in the next delivery pass', () async {
+      final log = EnvelopeRetryLog(storage: SecureStorageInMemory());
+      log.beginPass();
+      await log.recordFailure('env-1');
+      log.beginPass();
+
+      expect(await log.recordFailure('env-1'), 2);
+    });
+
     test('carries the count across a restart', () async {
       // THE bug this exists for: the count used to live in an in-memory map, so
       // it reset on every app start — and a poison envelope fails exactly once

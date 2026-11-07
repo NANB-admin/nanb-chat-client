@@ -40,7 +40,11 @@ class ControlSender {
       required bool force,
       required String pushKind,
     })? migrateMultiDevice,
+    void Function(String conversationId)? onGroupChanged,
+    Future<List<RatchetFanoutTarget>?> Function(Conversation convo)? fanoutTargets,
   })  : _migrateMultiDevice = migrateMultiDevice,
+        _fanoutTargets = fanoutTargets,
+        _onGroupChanged = onGroupChanged,
         _host = host,
         _crypto = crypto,
         _api = api,
@@ -66,15 +70,27 @@ class ControlSender {
     required String pushKind,
   })? _migrateMultiDevice;
 
+  /// Every device of a multi-device ratchet 1:1, each with its own ratchet. Null
+  /// result (or null in tests) means there's only the row's device.
+  final Future<List<RatchetFanoutTarget>?> Function(Conversation convo)?
+      _fanoutTargets;
+
+  /// Told when a control send moved a 1:1 onto a new MLS group.
+  final void Function(String conversationId)? _onGroupChanged;
+
   /// Encrypts + submits a control [body] to the peer of [conversationId] through
   /// the same ratchet/MLS path as a normal message (no on-screen bubble); the
   /// receiver detects the control and drops it. Auto-migrates ratchet→MLS on the
   /// first send when the peer has key packages.
   ///
   /// Addressing on an MLS 1:1 (one ciphertext opens on every member device):
-  /// [toDeviceId] targets that one peer device; [allPeerDevices] targets every
-  /// device in the peer's directory. Otherwise — and always on ratchet, whose
-  /// ciphertext is per-device — the row's `peerDeviceId`.
+  /// [toDeviceId] targets that one peer device; otherwise every device in the
+  /// peer's directory, or the row's `peerDeviceId` if the directory isn't known.
+  /// [allPeerDevices] also refreshes that directory first.
+  ///
+  /// On ratchet the ciphertext is per-device: the row's `peerDeviceId`, unless
+  /// [allPeerDevices] asks for one copy per device. It matters most for a rebuild
+  /// request, which is lost if the only device it reaches is switched off.
   ///
   /// On a GROUP the control goes to every member device except this one (our own
   /// other devices are members, so they receive it too). [onSealed] fires once
@@ -121,7 +137,20 @@ class ControlSender {
           onSealed?.call();
           return;
         }
-        allowMigration = outcome != ControlMigrationOutcome.deferToSibling;
+        allowMigration = outcome == ControlMigrationOutcome.notApplicable;
+        final fanoutTargets = _fanoutTargets;
+        if (allPeerDevices &&
+            !allowMigration &&
+            fanoutTargets != null &&
+            live.kind == ConversationKind.oneToOne) {
+          final targets = await fanoutTargets(live);
+          if (targets != null) {
+            onSealed?.call();
+            await _ratchetCore.fanout(conversationId, body, targets,
+                pushKind: effectivePushKind, selfAccountId: myAccountId);
+            return;
+          }
+        }
       }
       ConversationCryptoState? pendingRatchetState;
       final migrator = MlsMigrator(
@@ -161,7 +190,7 @@ class ControlSender {
       // the receive path or re-takes this lock.
       final targets = migResult.envelopeType == wire.EnvelopeType.mlsApplication
           ? _peerTargets(live.peerAccountId, live.peerDeviceId,
-              toDeviceId: toDeviceId, allPeerDevices: allPeerDevices)
+              toDeviceId: toDeviceId)
           : [live.peerDeviceId];
       final recipients = live.kind == ConversationKind.group
           ? _groupRecipients(live, session?.deviceId)
@@ -201,6 +230,7 @@ class ControlSender {
         await _host.db.upsertConversation(migrated);
         await _host.db.deleteConversationCryptoState(conversationId);
         _host.notifyHost();
+        _onGroupChanged?.call(conversationId);
       }
     });
   }
@@ -236,15 +266,12 @@ class ControlSender {
 
   /// The peer device(s) an MLS control goes to — see [sendControl].
   List<String> _peerTargets(String peerAccountId, String peerDeviceId,
-      {String? toDeviceId, required bool allPeerDevices}) {
+      {String? toDeviceId}) {
     if (toDeviceId != null && toDeviceId.isNotEmpty) return [toDeviceId];
-    if (allPeerDevices) {
-      final directory = [
-        for (final d in _deviceCache.peerDevices(peerAccountId)) d.deviceId,
-      ];
-      if (directory.isNotEmpty) return directory;
-    }
-    return [peerDeviceId];
+    final directory = [
+      for (final d in _deviceCache.peerDevices(peerAccountId)) d.deviceId,
+    ];
+    return directory.isNotEmpty ? directory : [peerDeviceId];
   }
 
   /// Sends a control [body] to THIS account's OTHER devices only (never the

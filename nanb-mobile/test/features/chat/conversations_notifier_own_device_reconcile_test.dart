@@ -23,6 +23,7 @@ import 'package:nanb_chat/features/chat/media_pipeline.dart';
 import 'package:nanb_chat/features/chat/pending_upload_staging.dart';
 import 'package:nanb_chat/features/chat/video/video_thumbnail_generator.dart';
 import 'package:nanb_chat/features/chat/video/video_thumbnail_loader.dart';
+import 'package:nanb_chat/features/chat/models/chat_message.dart';
 import 'package:nanb_chat/features/chat/models/conversation.dart';
 import 'package:nanb_chat/features/chat/models/message_kind.dart';
 import 'package:nanb_chat/features/chat/models/conversation_kind.dart';
@@ -47,14 +48,21 @@ class _FakeApiClient implements ApiClient {
   List<Device> devices = const [];
   List<DeviceKeyPackageResult> deviceKeyPackages = const [];
   int deviceKpFetches = 0;
+  List<AccountDevice> peerDevices = const [];
 
   @override
   Future<List<Device>> listDevices() async => devices;
+
+  /// When set, the next package lookup fails with it (a dropped connection).
+  Object? failNextKpFetch;
 
   @override
   Future<List<DeviceKeyPackageResult>> lookupDeviceKeyPackages(
       String username) async {
     deviceKpFetches++;
+    final fail = failNextKpFetch;
+    failNextKpFetch = null;
+    if (fail != null) throw fail;
     return deviceKeyPackages;
   }
   final Map<String, FetchKeyPackageResult> _keyPackages = {};
@@ -78,6 +86,7 @@ class _FakeApiClient implements ApiClient {
       username: username,
       identityPubKey: [1, 2, 3],
       x25519PubKey: [4, 5, 6],
+      devices: peerDevices,
     );
   }
 
@@ -116,6 +125,16 @@ class _FakeApiClient implements ApiClient {
 }
 
 class _RecordingCrypto implements CryptoBridge {
+  /// The group as CoreCrypto sees it. Null means this device holds no group.
+  Set<String>? members;
+
+  @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async {
+    final m = members;
+    if (m == null) throw StateError('no group $groupId');
+    return m;
+  }
+
   @override
   Future<bool> consumeMlsStoreReset() async => false;
 
@@ -352,6 +371,8 @@ class _FakeSupervisor extends ChangeNotifier implements WsReconnectSupervisor {
     _eventsCtrl.add(const Reconnected());
   }
 
+  void emitReconnected() => _eventsCtrl.add(const Reconnected());
+
   @override
   Future<void> stop() async {
     _state = ConnectionState.connecting;
@@ -467,24 +488,25 @@ void main() {
   late _FakeWs ws;
   late _FakeSupervisor supervisor;
   late ConversationsNotifier notifier;
+  late _RecordingCrypto crypto;
+  late AppDatabaseInMemory database;
 
   setUp(() async {
     api = _FakeApiClient();
+    crypto = _RecordingCrypto();
+    database = AppDatabaseInMemory();
     storage = SecureStorageInMemory();
     sessions = SessionRepository(storage);
     ws = _FakeWs();
     supervisor = _FakeSupervisor(wsClient: ws, sessions: sessions);
     await sessions.save(_selfSession);
-    // We previously knew only ourselves, so anything else is newly linked.
-    await storage.putString(
-        ConversationsNotifier.knownOwnDevicesKey, jsonEncode(['self-dev']));
     notifier = ConversationsNotifier(
       apiClient: api,
       wsClient: ws,
       supervisor: supervisor,
-      crypto: _RecordingCrypto(),
+      crypto: crypto,
       sessions: sessions,
-      database: AppDatabaseInMemory(),
+      database: database,
       secureStorage: storage,
       media: _FakeMediaPipeline(),
       pushRegistrar:
@@ -509,16 +531,11 @@ void main() {
     required List<Device> devices,
     List<DeviceKeyPackageResult> kps = const [],
     List<Conversation> convos = const [],
+    Set<String>? members = const {'self-dev', 'peer-dev'},
   }) async {
     api.devices = devices;
     api.deviceKeyPackages = kps;
-    // Everything except the "new-*" newcomers was already known.
-    await storage.putString(
-        ConversationsNotifier.knownOwnDevicesKey,
-        jsonEncode([
-          for (final d in devices)
-            if (!d.deviceId.startsWith('new-')) d.deviceId
-        ]));
+    crypto.members = members;
     for (final c in convos) {
       notifier.seed(c);
     }
@@ -533,112 +550,274 @@ void main() {
           p.recipientDeviceId == deviceId)
       .toList();
 
-  Future<Set<String>> knownDevices() async {
-    final raw = await storage.getString(ConversationsNotifier.knownOwnDevicesKey);
-    return (jsonDecode(raw!) as List).cast<String>().toSet();
-  }
+  group('who adds a device missing from a group', () {
+    test('a member adds it even if it was linked long ago', () async {
+      await connectWith(
+        devices: [_device('self-dev'), _device('old-sibling')],
+        kps: [_kp('old-sibling')],
+        convos: [_oneToOne()],
+      );
+      expect(welcomesTo('old-sibling'), hasLength(1));
+    });
 
-  group('adder election during reconcile', () {
-    test('the device that linked the newcomer adds it even if not smallest',
+    test('a device already in the group is left alone', () async {
+      await connectWith(
+        devices: [_device('self-dev'), _device('sibling')],
+        kps: [_kp('sibling')],
+        convos: [_oneToOne()],
+        members: {'self-dev', 'sibling', 'peer-dev'},
+      );
+      expect(welcomesTo('sibling'), isEmpty);
+    });
+
+    test('a member that is first in the order adds without waiting', () async {
+      await connectWith(
+        devices: [
+          _device('self-dev'),
+          _device('zzz-member'),
+          _device('missing'),
+        ],
+        kps: [_kp('missing')],
+        convos: [_oneToOne()],
+        members: {'self-dev', 'zzz-member', 'peer-dev'},
+      );
+      expect(welcomesTo('missing'), hasLength(1));
+    });
+
+    test('a member further down the order waits its turn', () async {
+      await connectWith(
+        devices: [
+          _device('aaa-member'),
+          _device('self-dev'),
+          _device('missing'),
+        ],
+        kps: [_kp('missing')],
+        convos: [_oneToOne()],
+        members: {'aaa-member', 'self-dev', 'peer-dev'},
+      );
+      expect(welcomesTo('missing'), isEmpty);
+    });
+
+    test('a member further down the order adds once the first has had its chance',
         () async {
+      notifier.ownDeviceRankStep = const Duration(milliseconds: 1);
       await connectWith(
         devices: [
-          _device('aaa-old'),
+          _device('aaa-member'),
           _device('self-dev'),
-          _device('new-1', linkedBy: 'self-dev'),
+          _device('missing'),
         ],
-        kps: [_kp('new-1')],
+        kps: [_kp('missing')],
         convos: [_oneToOne()],
+        members: {'aaa-member', 'self-dev', 'peer-dev'},
       );
-      expect(welcomesTo('new-1'), hasLength(1));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await pumpEventQueue();
+      expect(welcomesTo('missing'), hasLength(1));
     });
 
-    test('a device that did not link the newcomer does NOT add it', () async {
-      await connectWith(
-        devices: [
-          _device('self-dev'),
-          _device('zzz-linker'),
-          _device('new-1', linkedBy: 'zzz-linker'),
-        ],
-        kps: [_kp('new-1')],
-        convos: [_oneToOne()],
-      );
-      expect(welcomesTo('new-1'), isEmpty);
-    });
-
-    test('a non-adder still records the newcomer as handled', () async {
-      await connectWith(
-        devices: [
-          _device('self-dev'),
-          _device('zzz-linker'),
-          _device('new-1', linkedBy: 'zzz-linker'),
-        ],
-        kps: [_kp('new-1')],
-        convos: [_oneToOne()],
-      );
-      expect(await knownDevices(), contains('new-1'));
-    });
-
-    test('falls back to the smallest old id when linkedBy is null', () async {
-      await connectWith(
-        devices: [
-          _device('self-dev'),
-          _device('zzz-old'),
-          _device('new-1'),
-        ],
-        kps: [_kp('new-1')],
-        convos: [_oneToOne()],
-      );
-      expect(welcomesTo('new-1'), hasLength(1));
-    });
-
-    test('falls back to the smallest old id when linkedBy is no longer active',
+    test('a member further down stands down if the first added it meanwhile',
         () async {
+      notifier.ownDeviceRankStep = const Duration(milliseconds: 1);
       await connectWith(
         devices: [
+          _device('aaa-member'),
           _device('self-dev'),
-          _device('zzz-old'),
-          _device('new-1', linkedBy: 'revoked-dev'),
+          _device('missing'),
         ],
-        kps: [_kp('new-1')],
+        kps: [_kp('missing')],
         convos: [_oneToOne()],
+        members: {'aaa-member', 'self-dev', 'peer-dev'},
       );
-      expect(welcomesTo('new-1'), hasLength(1));
+      crypto.members = {'aaa-member', 'self-dev', 'missing', 'peer-dev'};
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await pumpEventQueue();
+      expect(welcomesTo('missing'), isEmpty);
     });
 
-    test('fallback by smallest id does not add when we are not the smallest',
-        () async {
+    test('a device outside the group adds nobody', () async {
       await connectWith(
-        devices: [
-          _device('aaa-old'),
-          _device('self-dev'),
-          _device('new-1'),
-        ],
-        kps: [_kp('new-1')],
+        devices: [_device('self-dev'), _device('other')],
+        kps: [_kp('other')],
+        convos: [_oneToOne()],
+        members: {'other', 'peer-dev'},
+      );
+      expect(welcomesTo('other'), isEmpty);
+    });
+
+    test('a device with no group here adds nobody', () async {
+      await connectWith(
+        devices: [_device('self-dev'), _device('other')],
+        kps: [_kp('other')],
+        convos: [_oneToOne()],
+        members: null,
+      );
+      expect(welcomesTo('other'), isEmpty);
+    });
+
+    test('the Commit goes only to devices really in the group', () async {
+      api.peerDevices = const [
+        AccountDevice(deviceId: 'peer-dev'),
+        AccountDevice(deviceId: 'peer-left-out'),
+      ];
+      await connectWith(
+        devices: [_device('self-dev'), _device('missing')],
+        kps: [_kp('missing')],
         convos: [_oneToOne()],
       );
-      expect(welcomesTo('new-1'), isEmpty);
+      final commits = api.submittedMessages
+          .where((p) => p.envelopeType == EnvelopeType.mlsHandshake)
+          .map((p) => p.recipientDeviceId);
+      expect(commits, ['peer-dev']);
     });
   });
 
-  group('adder with a newcomer that has no key package yet', () {
+  group('a device that comes back into the group', () {
+    Future<void> sweepAgain() async {
+      supervisor.emitReconnected();
+      await pumpEventQueue();
+    }
+
+    List<SubmitMessagePayload> historyTo(String deviceId) => api
+        .submittedMessages
+        .where((p) =>
+            p.envelopeType == EnvelopeType.mlsApplication &&
+            p.recipientDeviceId == deviceId)
+        .toList();
+
+    setUp(() async {
+      final c = _oneToOne();
+      await database.open(masterKeyHex: 'k');
+      await database.upsertConversation(c);
+      await database.upsertMessages(c.id, [
+        ChatMessage(
+          envelopeId: 'sent-while-it-was-out',
+          conversationId: c.id,
+          senderDeviceId: 'peer-dev',
+          body: 'you missed this',
+          serverTs: DateTime.utc(2026, 11, 7),
+          mine: false,
+        ),
+      ]);
+    });
+
+    test('gets the history it missed', () async {
+      await connectWith(
+        devices: [_device('self-dev'), _device('sibling')],
+        convos: [_oneToOne()],
+        members: {'self-dev', 'peer-dev'},
+      );
+      crypto.members = {'self-dev', 'sibling', 'peer-dev'};
+      await sweepAgain();
+      expect(historyTo('sibling'), hasLength(1));
+    });
+
+    test('the history includes what this device sent itself', () async {
+      final c = _oneToOne();
+      await database.upsertMessages(c.id, [
+        ChatMessage(
+          envelopeId: 'sent-by-me',
+          conversationId: c.id,
+          senderDeviceId: 'self-dev',
+          body: 'I sent this',
+          serverTs: DateTime.utc(2026, 11, 7, 1),
+          mine: true,
+          outboxId: '',
+        ),
+      ]);
+      await connectWith(
+        devices: [_device('self-dev'), _device('sibling')],
+        convos: [_oneToOne()],
+        members: {'self-dev', 'peer-dev'},
+      );
+      crypto.members = {'self-dev', 'sibling', 'peer-dev'};
+      await sweepAgain();
+      final body = utf8.decode(historyTo('sibling').single.ciphertext);
+      expect(body, contains('I sent this'));
+    });
+
+    test('gets nothing from a device that is not first in line', () async {
+      await connectWith(
+        devices: [_device('aaa-other'), _device('self-dev'), _device('sibling')],
+        convos: [_oneToOne()],
+        members: {'aaa-other', 'self-dev', 'peer-dev'},
+      );
+      crypto.members = {'aaa-other', 'self-dev', 'sibling', 'peer-dev'};
+      await sweepAgain();
+      expect(historyTo('sibling'), isEmpty);
+    });
+
+    test('the device that came back is not the one asked to replay', () async {
+      await connectWith(
+        devices: [_device('aaa-back'), _device('self-dev')],
+        convos: [_oneToOne()],
+        members: {'self-dev', 'peer-dev'},
+      );
+      crypto.members = {'aaa-back', 'self-dev', 'peer-dev'};
+      await sweepAgain();
+      expect(historyTo('aaa-back'), hasLength(1));
+    });
+
+    test('a device that never left gets no replay', () async {
+      await connectWith(
+        devices: [_device('self-dev'), _device('sibling')],
+        convos: [_oneToOne()],
+        members: {'self-dev', 'sibling', 'peer-dev'},
+      );
+      await sweepAgain();
+      expect(historyTo('sibling'), isEmpty);
+    });
+  });
+
+  test('a device whose packages arrive after the link is added without a reconnect',
+      () async {
+    notifier.ownDeviceNoPackageWaits = const [Duration(milliseconds: 1)];
+    await connectWith(
+      devices: [_device('self-dev'), _device('missing')],
+      kps: const [],
+      convos: [_oneToOne()],
+    );
+    api.deviceKeyPackages = [_kp('missing')];
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    await pumpEventQueue();
+    expect(welcomesTo('missing'), hasLength(1));
+  });
+
+  test('a failed package lookup is retried without waiting for a reconnect',
+      () async {
+    notifier.ownDeviceNoPackageWaits = const [Duration(milliseconds: 1)];
+    api.failNextKpFetch = Exception('connection dropped');
+    await connectWith(
+      devices: [_device('self-dev'), _device('missing')],
+      kps: [_kp('missing')],
+      convos: [_oneToOne()],
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    await pumpEventQueue();
+    expect(welcomesTo('missing'), hasLength(1));
+  });
+
+  group('a device with no key package to add it with', () {
     setUp(() async {
       await connectWith(
-        devices: [_device('self-dev'), _device('new-1', linkedBy: 'self-dev')],
+        devices: [_device('self-dev'), _device('missing')],
         kps: const [],
         convos: [_oneToOne()],
       );
     });
 
-    test('does not rebaseline, so a later sweep retries', () async {
-      expect(await knownDevices(), isNot(contains('new-1')));
-    });
-
-    test('adds the device once its key package appears', () async {
-      api.deviceKeyPackages = [_kp('new-1')];
+    test('is added once the server says the device list changed', () async {
+      api.deviceKeyPackages = [_kp('missing')];
       ws.pushDevicesChanged();
       await pumpEventQueue();
-      expect(welcomesTo('new-1'), hasLength(1));
+      expect(welcomesTo('missing'), hasLength(1));
+    });
+
+    test('does not burn more packages on the next sweep', () async {
+      final fetches = api.deviceKpFetches;
+      supervisor.emitReconnected();
+      await pumpEventQueue();
+      expect(api.deviceKpFetches, fetches);
     });
   });
 
@@ -652,6 +831,31 @@ void main() {
       );
       expect(welcomesTo('new-1').where((p) => p.conversationId == 'group:g1'),
           hasLength(1));
+    });
+
+    test('a device the roster lists but the group lost is added back', () async {
+      final g = _group();
+      await connectWith(
+        devices: [_device('self-dev'), _device('new-1')],
+        kps: [_kp('new-1')],
+        convos: [
+          g.copyWith(members: [...g.members, _member('self-acc', 'new-1', isSelf: true)])
+        ],
+      );
+      expect(welcomesTo('new-1'), hasLength(1));
+    });
+
+    test('adding back a listed device keeps one roster row', () async {
+      final g = _group();
+      await connectWith(
+        devices: [_device('self-dev'), _device('new-1')],
+        kps: [_kp('new-1')],
+        convos: [
+          g.copyWith(members: [...g.members, _member('self-acc', 'new-1', isSelf: true)])
+        ],
+      );
+      final members = notifier.conversation('group:g1')!.members;
+      expect(members.where((m) => m.deviceId == 'new-1'), hasLength(1));
     });
 
     test('existing member devices receive the Commit', () async {
@@ -678,26 +882,12 @@ void main() {
           hasLength(1));
     });
 
-    test('a group that already lists the device is left alone', () async {
-      final g = _group();
+    test('a group that really holds the device is left alone', () async {
       await connectWith(
-        devices: [_device('self-dev'), _device('new-1', linkedBy: 'self-dev')],
-        kps: [_kp('new-1')],
-        convos: [
-          g.copyWith(members: [...g.members, _member('self-acc', 'new-1', isSelf: true)])
-        ],
-      );
-      expect(welcomesTo('new-1'), isEmpty);
-    });
-
-    test('a group the device was already added to is not re-added on retry',
-        () async {
-      await storage.putString(ConversationsNotifier.ownDeviceAddedKey,
-          jsonEncode(['new-1|group:g1']));
-      await connectWith(
-        devices: [_device('self-dev'), _device('new-1', linkedBy: 'self-dev')],
+        devices: [_device('self-dev'), _device('new-1')],
         kps: [_kp('new-1')],
         convos: [_group()],
+        members: {'self-dev', 'new-1', 'peer-dev'},
       );
       expect(welcomesTo('new-1'), isEmpty);
     });

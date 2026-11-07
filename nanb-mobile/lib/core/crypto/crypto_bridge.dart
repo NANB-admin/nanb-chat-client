@@ -166,6 +166,12 @@ abstract class CryptoBridge {
   /// Diagnostic: current MLS epoch number for a group.
   Future<int> currentEpoch(String groupId);
 
+  /// The device ids that are actually members of [groupId] in THIS device's MLS
+  /// state (client id == device id). This is the truth to reconcile against: a
+  /// directory says who SHOULD be in a group, only this says who is. Throws if
+  /// this device holds no such group.
+  Future<Set<String>> groupMemberDeviceIds(String groupId);
+
   /// Encrypt application data under the current group epoch's key.
   Future<List<int>> encrypt({
     required String groupId,
@@ -370,6 +376,9 @@ class CryptoBridgeStub implements CryptoBridge {
 
   @override
   Future<int> currentEpoch(String groupId) async => 0;
+
+  @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async => const {};
 
   @override
   Future<List<int>> encrypt({

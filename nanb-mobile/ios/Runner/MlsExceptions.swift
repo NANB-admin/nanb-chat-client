@@ -26,7 +26,8 @@ import Foundation
 /// Mapping intent (must stay aligned with Android):
 ///   duplicate / wrong-epoch / stale / too-old / self-commit / rejected
 ///                                              -> mls_decrypt_failed
-///   conversation-already-exists / orphan-welcome -> mls_invalid_argument
+///   orphan-welcome                                -> mls_orphan_welcome
+///   conversation-already-exists                   -> mls_invalid_argument
 ///   "not found"                                   -> mls_unknown_group
 ///   other MLS error                               -> mls_unknown
 ///   IO / transaction failure                      -> mls_io
@@ -85,7 +86,9 @@ extension FlutterError {
                   "epoch too old", "self commit", "self-commit",
                   "message rejected", "messagerejected") {
       code = "mls_decrypt_failed"
-    } else if has("already exists", "orphan welcome", "orphanwelcome") {
+    } else if has("orphan welcome", "orphanwelcome") {
+      code = "mls_orphan_welcome"
+    } else if has("already exists", "alreadyexists") {
       code = "mls_invalid_argument"
     } else if has("invalid argument", "illegalargument") {
       code = "mls_invalid_argument"

@@ -9,7 +9,12 @@ enum ControlMigrationOutcome {
   /// build a group of its own (it would fork the chat) and sends on ratchet.
   deferToSibling,
 
-  /// Not a multi-device 1:1 on ratchet, or the peer isn't MLS-ready yet: the
+  /// Not a ratchet 1:1, or one confirmed to have a single device on each side: the
   /// normal single-peer path applies.
   notApplicable,
+
+  /// A group holding every device couldn't be built right now (a lookup failed,
+  /// or the peer has no packages). Stay on ratchet rather than build a group that
+  /// leaves devices out.
+  stayOnRatchet,
 }

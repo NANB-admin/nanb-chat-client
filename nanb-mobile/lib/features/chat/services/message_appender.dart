@@ -41,7 +41,9 @@ class MessageAppender {
     bool Function()? appInForeground,
     String? Function()? activeConversationId,
     bool Function(String envelopeId)? isCatchupEnvelope,
-  })  : _host = host,
+    void Function(wire.Envelope env, String myDeviceId)? onRebuildRequested,
+  })  : _onRebuildRequested = onRebuildRequested,
+        _host = host,
         _controlReceiver = controlReceiver,
         _controlSender = controlSender,
         _callSignalHandler = callSignalHandler,
@@ -50,6 +52,9 @@ class MessageAppender {
         _appInForeground = appInForeground ?? (() => true),
         _activeConversationId = activeConversationId ?? (() => null),
         _isCatchupEnvelope = isCatchupEnvelope ?? ((_) => false);
+
+  /// A peer asked over ratchet for this 1:1's group to be rebuilt.
+  final void Function(wire.Envelope env, String myDeviceId)? _onRebuildRequested;
 
   final NotifierServiceHost _host;
   final ControlReceiver _controlReceiver;
@@ -127,6 +132,13 @@ class MessageAppender {
     // encrypted body. They are never rendered — act on them and drop them.
     final control = MessageControl.tryDecode(wireBody);
     if (control != null) {
+      // Inside the group, this control proves convergence and means nothing more.
+      // Over ratchet it is a peer that can't use our group asking for a new one,
+      // and it may be the only signal we ever get.
+      if (control.isReestablish &&
+          env.envelopeType == wire.EnvelopeType.textLegacy) {
+        _onRebuildRequested?.call(env, myDeviceId);
+      }
       await _controlReceiver.applyControl(
           convoId, control, env.senderDeviceId, myDeviceId);
       await _host.ack([env.envelopeId]);
@@ -218,6 +230,8 @@ class MessageAppender {
         await _host.db.hasMessageWithClientId(
             convoId, env.senderDeviceId, clientMsgId)) {
       await _host.ack([env.envelopeId]);
+      // Answer again, or a sender whose first receipt was lost keeps resending.
+      await _reconfirmDuplicate(env, myDeviceId, convoId, clientMsgId);
       return;
     }
 
@@ -292,10 +306,12 @@ class MessageAppender {
         !blocked &&
         updated.kind == ConversationKind.oneToOne &&
         kind != MessageKind.system) {
-      final eid = env.envelopeId;
+      // Both names: only the client id survives a fan-out or a resend, and older
+      // senders match on the envelope id.
+      final ids = [env.envelopeId, ?clientMsgId];
       unawaited(Future(() => _controlSender.sendControl(
             convoId,
-            MessageControl.receipt(ReceiptKind.delivered, [eid]).encode(),
+            MessageControl.receipt(ReceiptKind.delivered, ids).encode(),
           )));
     }
 
@@ -331,6 +347,24 @@ class MessageAppender {
     }
   }
 
+  /// Re-confirms a message we already hold. Peer messages only: a self-synced copy
+  /// of our own send has nobody to answer, and a blocked contact gets no receipts.
+  Future<void> _reconfirmDuplicate(wire.Envelope env, String myDeviceId,
+      String convoId, String clientMsgId) async {
+    final convo = _host.conversation(convoId);
+    if (convo == null ||
+        convo.blocked ||
+        convo.kind != ConversationKind.oneToOne ||
+        await _host.isMyDeviceWarm(env.senderDeviceId, myDeviceId)) {
+      return;
+    }
+    final ids = [env.envelopeId, clientMsgId];
+    unawaited(Future(() => _controlSender.sendControl(
+          convoId,
+          MessageControl.receipt(ReceiptKind.delivered, ids).encode(),
+        )));
+  }
+
   /// Stores a chunk of backfilled history from a sibling device. Each message
   /// keeps its ORIGINAL envelope id (the PK, REPLACE-on-conflict), serverTs (so
   /// it sorts into place), and `mine` attribution. No unread bump, no receipts:
@@ -341,9 +375,17 @@ class MessageAppender {
     final convo = _host.conversation(convoId);
     if (convo == null) return;
     final existingIds = {for (final m in convo.messages) m.envelopeId};
+    // A sibling's copy of a message carries ITS envelope id, not ours, so match
+    // on the sender's own message id too.
+    final existingCids = {
+      for (final m in convo.messages)
+        if (m.clientMsgId != null) m.clientMsgId!,
+    };
     final additions = <ChatMessage>[];
     for (final b in backfill.messages) {
       if (existingIds.contains(b.envelopeId)) continue;
+      final cid = b.clientMsgId;
+      if (cid != null && !existingCids.add(cid)) continue;
       existingIds.add(b.envelopeId);
       additions.add(ChatMessage(
         envelopeId: b.envelopeId,
@@ -366,6 +408,7 @@ class MessageAppender {
         replyToSender: b.replyToSender,
         replyToPreview: b.replyToPreview,
         forwarded: b.forwarded,
+        clientMsgId: b.clientMsgId,
         expiresAt: b.expiresAtMs == null
             ? null
             : DateTime.fromMillisecondsSinceEpoch(b.expiresAtMs!, isUtc: true),

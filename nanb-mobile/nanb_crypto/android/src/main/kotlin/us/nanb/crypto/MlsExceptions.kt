@@ -34,8 +34,8 @@ internal fun MethodChannel.Result.errorFor(e: Throwable) {
                 is MlsException.MessageEpochTooOld,
                 is MlsException.SelfCommitIgnored,
                 is MlsException.MessageRejected -> "mls_decrypt_failed" to (mls.message ?: mls.javaClass.simpleName)
-                is MlsException.ConversationAlreadyExists,
-                is MlsException.OrphanWelcome -> "mls_invalid_argument" to (mls.message ?: mls.javaClass.simpleName)
+                is MlsException.OrphanWelcome -> "mls_orphan_welcome" to (mls.message ?: mls.javaClass.simpleName)
+                is MlsException.ConversationAlreadyExists -> "mls_invalid_argument" to (mls.message ?: mls.javaClass.simpleName)
                 is MlsException.Other -> {
                     val mlsMsg = mls.msg
                     // CoreCrypto reports a missing conversation/group through the

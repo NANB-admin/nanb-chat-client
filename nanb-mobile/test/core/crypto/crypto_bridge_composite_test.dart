@@ -10,6 +10,9 @@ import 'package:nanb_chat/core/crypto/decrypt_mls_result.dart';
 
 class _RecordingIdentity implements CryptoBridge {
   @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async => const {};
+
+  @override
   Future<bool> consumeMlsStoreReset() async => false;
 
   final List<String> calls = [];
@@ -143,6 +146,9 @@ class _RecordingIdentity implements CryptoBridge {
 }
 
 class _RecordingMls implements CryptoBridge {
+  @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async => const {};
+
   @override
   Future<bool> consumeMlsStoreReset() async => false;
 

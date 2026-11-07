@@ -44,6 +44,19 @@ class EnvelopeRetryLog {
   Future<void>? _pendingWrite;
   bool _dirty = false;
 
+  /// Ids already counted in the current delivery pass; null outside a pass.
+  Set<String>? _countedThisPass;
+
+  /// Starts one delivery pass (a catchup drain). Until [endPass], each envelope
+  /// counts at most once, however many layers report it. The receiver and the
+  /// drain's backstop both report the same undecryptable envelope, and counting
+  /// both spent the redelivery budget twice as fast: a message was destroyed on
+  /// the third reconnect, not the fifth.
+  void beginPass() => _countedThisPass = <String>{};
+
+  /// Ends the pass started by [beginPass].
+  void endPass() => _countedThisPass = null;
+
   /// Total failures recorded this session — lets a caller report how many
   /// envelopes failed SILENTLY inside the receivers, which the catchup drain
   /// cannot otherwise see (the receivers swallow their own decrypt errors, so
@@ -55,6 +68,10 @@ class EnvelopeRetryLog {
   Future<int> recordFailure(String envelopeId) async {
     if (envelopeId.isEmpty) return 0;
     await _ensureLoaded();
+    final pass = _countedThisPass;
+    if (pass != null && !pass.add(envelopeId)) {
+      return _counts[envelopeId] ?? 0;
+    }
     _failuresRecorded++;
     final n = (_counts[envelopeId] ?? 0) + 1;
     _counts[envelopeId] = n;

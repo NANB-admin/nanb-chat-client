@@ -19,6 +19,9 @@ class _MockApi extends Mock implements ApiClient {}
 
 class _RecordingCrypto implements CryptoBridge {
   @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async => const {};
+
+  @override
   Future<bool> consumeMlsStoreReset() async => false;
 
   final List<List<int>> mintedKeyPackages = [];

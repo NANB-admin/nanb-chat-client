@@ -207,6 +207,13 @@ class CryptoBridgeNative implements CryptoBridge {
   }
 
   @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async {
+    final res =
+        await _invoke<List<Object?>>('groupMembers', {'groupId': groupId});
+    return res!.cast<String>().toSet();
+  }
+
+  @override
   Future<List<int>> encrypt({
     required String groupId,
     required List<int> plaintext,
@@ -302,6 +309,8 @@ class CryptoBridgeNative implements CryptoBridge {
         return MlsIoException(msg);
       case 'mls_invalid_argument':
         return MlsArgumentException(msg);
+      case 'mls_orphan_welcome':
+        return MlsOrphanWelcomeException(msg);
       default:
         return MlsUnknownException(e.code, msg);
     }

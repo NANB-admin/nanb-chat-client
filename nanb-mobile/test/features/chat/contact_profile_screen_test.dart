@@ -58,6 +58,9 @@ class _FakeNotifier extends ChangeNotifier implements ConversationsNotifier {
 
 class _FakeCrypto implements CryptoBridge {
   @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async => const {};
+
+  @override
   Future<bool> consumeMlsStoreReset() async => false;
 
   @override

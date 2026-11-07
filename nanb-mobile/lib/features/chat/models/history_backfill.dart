@@ -29,6 +29,7 @@ class BackfillMessage {
     this.replyToSender,
     this.replyToPreview,
     this.forwarded = false,
+    this.clientMsgId,
   });
 
   final String envelopeId;
@@ -50,6 +51,11 @@ class BackfillMessage {
   final String? replyToSender;
   final String? replyToPreview;
   final bool forwarded;
+
+  /// The sender's own id for this message, the same on every device. Envelope
+  /// ids differ per device, so this is what tells a device it already has a
+  /// message its sibling replays.
+  final String? clientMsgId;
 
   /// Compact JSON. Byte arrays are base64 (smaller + safe inside JSON); absent
   /// optional fields are omitted to keep chunks small.
@@ -73,6 +79,7 @@ class BackfillMessage {
         if (replyToSender != null) 'rsnd': replyToSender,
         if (replyToPreview != null) 'rprev': replyToPreview,
         if (forwarded) 'fwd': true,
+        if (clientMsgId != null) 'cid': clientMsgId,
       };
 
   static BackfillMessage? fromJson(Map<Object?, Object?> j) {
@@ -123,6 +130,7 @@ class BackfillMessage {
       replyToSender: j['rsnd'] is String ? j['rsnd'] as String : null,
       replyToPreview: j['rprev'] is String ? j['rprev'] as String : null,
       forwarded: j['fwd'] == true,
+      clientMsgId: j['cid'] is String ? j['cid'] as String : null,
     );
   }
 }

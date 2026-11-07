@@ -253,6 +253,18 @@ final class NanbCryptoChannel {
         // u64 can't cross the channel; cast to Int (Dart int).
         reply(result, Int(epoch))
 
+      case "groupMembers":
+        guard let groupId = stringArg(args, "groupId") else {
+          throw NanbMlsError.missingArgument("missing groupId")
+        }
+        let cc = try await MlsClientHolder.shared.clientOrThrow()
+        // Same read-only transaction as conversationEpoch. clientId == deviceId, so
+        // each decodes straight to the device id.
+        let members: [ClientId] = try await cc.transaction { ctx in
+          try await ctx.getClientIds(conversationId: Self.convId(groupId))
+        }
+        reply(result, members.map { String(decoding: $0.copyBytes(), as: UTF8.self) })
+
       case "replaceGroup":
         guard let localGroupId = stringArg(args, "localGroupId") else {
           throw NanbMlsError.missingArgument("missing localGroupId")
@@ -275,15 +287,30 @@ final class NanbCryptoChannel {
         // meant a re-invite could never be adopted — the Welcome failed
         // identically on every catchup, forever. Nothing to wipe is exactly the
         // state processWelcomeMessage below wants.
-        try? await cc.transaction { ctx in
-          try await ctx.wipeConversation(conversationId: Self.convId(localGroupId))
+        //
+        // OPEN THE WELCOME FIRST. CoreCrypto decrypts it before it checks for an
+        // existing group (crypto/src/mls/conversation/welcome.rs), so "already
+        // exists" proves this Welcome is good and only then do we wipe. Wiping
+        // first destroyed a healthy group whenever the Welcome turned out to be
+        // built from a dead key package.
+        func join() async throws -> String {
+          try await cc.transaction { ctx in
+            let welcomeBundle = try await ctx.processWelcomeMessage(
+              welcomeMessage: Self.welcome(from: foreignWelcome),
+              customConfiguration: Self.defaultCustomConfiguration()
+            )
+            return Self.welcomeBundleIdString(welcomeBundle)
+          }
         }
-        let newGroupId: String = try await cc.transaction { ctx in
-          let welcomeBundle = try await ctx.processWelcomeMessage(
-            welcomeMessage: Self.welcome(from: foreignWelcome),
-            customConfiguration: Self.defaultCustomConfiguration()
-          )
-          return Self.welcomeBundleIdString(welcomeBundle)
+        let newGroupId: String
+        do {
+          newGroupId = try await join()
+        } catch {
+          guard "\(error)".lowercased().contains("alreadyexists") else { throw error }
+          try? await cc.transaction { ctx in
+            try await ctx.wipeConversation(conversationId: Self.convId(localGroupId))
+          }
+          newGroupId = try await join()
         }
         reply(result, newGroupId)
 

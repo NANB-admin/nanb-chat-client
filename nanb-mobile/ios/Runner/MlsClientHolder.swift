@@ -3,6 +3,7 @@
 // Wire's package added in ios/Podfile. Authored on Windows and NOT yet compiled;
 // reconcile any symbol-name mismatches against the generated bindings (§4).
 import Foundation
+import UIKit
 // TODO(ios): confirm Wire's CoreCrypto module name (WireCoreCrypto vs CoreCrypto).
 import WireCoreCrypto
 
@@ -186,24 +187,42 @@ actor MlsClientHolder {
     // a throwing ctor with label `key:` (crypto-ffi database/key.rs `new(key:)`);
     // the outer `try` covers it. Confirmed vs v9.3.4.
     do {
-      return try await WireCoreCrypto.CoreCrypto(
+      let opened = try await WireCoreCrypto.CoreCrypto(
         keystorePath: path,
         key: DatabaseKey(key: key)
       )
+      CoreCryptoKeychainSalt.deleteOrphans(forStorePath: path)
+      return opened
     } catch {
       let firstError = error
+      // A phone not yet unlocked since boot can't read the salt or the file. That
+      // says nothing about the store, and a push can launch us in this state, so
+      // fail this open and leave everything in place for the next one.
+      let unlocked = await MainActor.run { UIApplication.shared.isProtectedDataAvailable }
+      guard unlocked else {
+        throw NanbMlsError.storeOpenFailed(
+          "CoreCrypto store at \(path) is unavailable while the device is locked. "
+            + "first=\(firstError)")
+      }
       // Recover before destroying: if the container path moved under an app
-      // update, the salt is still in the keychain under the old path's hash.
-      // Re-filing it keeps every MLS group; purging loses them all. Only with
-      // the db file present — a stale salt on a NEW file is its own brick.
-      if FileManager.default.fileExists(atPath: path),
-        CoreCryptoKeychainSalt.adoptOrphan(forStorePath: path),
-        let recovered = try? await WireCoreCrypto.CoreCrypto(
-          keystorePath: path,
-          key: DatabaseKey(key: key)
-        )
-      {
-        return recovered
+      // update, the salt is still in the keychain under an old path's hash. Finding
+      // it keeps every MLS group; purging loses them all, and every chat this
+      // phone has then loses whatever is in flight. Try EVERY candidate: requiring
+      // exactly one made recovery impossible after the first miss, because that
+      // purge left its old salt behind, so each later update purged too (one
+      // account lost its store ten times in twelve days). Only with the db file
+      // present: a stale salt on a NEW file is its own brick.
+      if FileManager.default.fileExists(atPath: path) {
+        for orphan in CoreCryptoKeychainSalt.orphans(forStorePath: path) {
+          guard CoreCryptoKeychainSalt.adopt(orphan: orphan, forStorePath: path),
+            let recovered = try? await WireCoreCrypto.CoreCrypto(
+              keystorePath: path,
+              key: DatabaseKey(key: key)
+            )
+          else { continue }
+          CoreCryptoKeychainSalt.deleteOrphans(forStorePath: path)
+          return recovered
+        }
       }
       purgeStore(at: path)
       do {
@@ -234,6 +253,7 @@ actor MlsClientHolder {
       try? fm.removeItem(atPath: p)
     }
     CoreCryptoKeychainSalt.delete(forStorePath: path)
+    CoreCryptoKeychainSalt.deleteOrphans(forStorePath: path)
     storeWasReset = true
   }
 

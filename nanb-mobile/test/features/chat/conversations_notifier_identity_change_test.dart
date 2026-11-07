@@ -215,6 +215,9 @@ class _FakeSupervisor extends ChangeNotifier implements WsReconnectSupervisor {
 
 class _PassthroughCrypto implements CryptoBridge {
   @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async => const {};
+
+  @override
   Future<bool> consumeMlsStoreReset() async => false;
 
   int encryptCalls = 0;

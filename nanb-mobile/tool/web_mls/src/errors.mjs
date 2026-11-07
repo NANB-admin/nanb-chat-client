@@ -15,7 +15,12 @@ const DECRYPT_FAILED = new Set([
   MlsErrorType.SelfCommitIgnored,
   MlsErrorType.MessageRejected,
 ]);
-const INVALID_ARGUMENT = new Set([MlsErrorType.ConversationAlreadyExists, MlsErrorType.OrphanWelcome]);
+const INVALID_ARGUMENT = new Set([MlsErrorType.ConversationAlreadyExists]);
+
+/** True when a Welcome opened fine but a group with its id already exists. */
+export function isConversationAlreadyExists(e) {
+  return isCcError(e, ErrorType.Mls) && e.context && e.context.type === MlsErrorType.ConversationAlreadyExists;
+}
 
 function looksLikeMissingConversation(text) {
   const lower = String(text).toLowerCase();
@@ -28,6 +33,7 @@ export function classify(e) {
   if (isCcError(e, ErrorType.Mls)) {
     const t = e.context && e.context.type;
     if (DECRYPT_FAILED.has(t)) return ["mls_decrypt_failed", message];
+    if (t === MlsErrorType.OrphanWelcome) return ["mls_orphan_welcome", message];
     if (INVALID_ARGUMENT.has(t)) return ["mls_invalid_argument", message];
     const detail = e.context && e.context.context && e.context.context.msg ? e.context.context.msg : message;
     if (looksLikeMissingConversation(detail) || looksLikeMissingConversation(message)) return ["mls_unknown_group", detail];

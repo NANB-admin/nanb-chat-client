@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:nanb_chat/core/crypto/conversation_crypto_state.dart';
 import 'package:nanb_chat/core/crypto/crypto_bridge.dart';
 import 'package:nanb_chat/core/models/account.dart';
 import 'package:nanb_chat/core/models/jwt_session.dart';
@@ -19,6 +20,9 @@ const _convoId = '1to1:acc-me:acc-bob';
 const _groupId = 'group:g1';
 
 class _FakeCrypto implements CryptoBridge {
+  @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async => const {};
+
   _FakeCrypto(this.order);
 
   final List<String> order;
@@ -70,6 +74,28 @@ class _FakeSessions implements SessionRepository {
 }
 
 class _FakeRatchet implements RatchetCore {
+  final fanouts = <List<RatchetFanoutTarget>>[];
+
+  @override
+  Future<SubmitMessageResult> fanout(
+    String conversationId,
+    String wireBody,
+    List<RatchetFanoutTarget> targets, {
+    String? pushKind,
+    String? selfAccountId,
+  }) async {
+    fanouts.add(targets);
+    return SubmitMessageResult(envelopeId: 'e', serverTs: DateTime.utc(2026));
+  }
+
+  @override
+  Future<List<int>> encryptForConvo(
+    Conversation convo,
+    List<int> plaintext, {
+    void Function(ConversationCryptoState)? onStateAdvanced,
+  }) async =>
+      plaintext;
+
   @override
   dynamic noSuchMethod(Invocation invocation) =>
       super.noSuchMethod(invocation);
@@ -142,7 +168,9 @@ Conversation _group(List<GroupMember> members) => Conversation(
     );
 
 class _Rig {
-  _Rig(Conversation convo, {ControlMigrationOutcome? migrationOutcome}) {
+  _Rig(Conversation convo,
+      {ControlMigrationOutcome? migrationOutcome,
+      List<RatchetFanoutTarget>? fanoutTargets}) {
     api = _FakeApi(order);
     host = _FakeHost(convo, order);
     cache = DeviceCache(api: api);
@@ -151,9 +179,10 @@ class _Rig {
       crypto: crypto,
       api: api,
       sessions: _FakeSessions(),
-      ratchetCore: _FakeRatchet(),
+      ratchetCore: ratchet,
       deviceCache: cache,
       contentTtlSeconds: () => null,
+      fanoutTargets: (_) async => fanoutTargets,
       migrateMultiDevice: migrationOutcome == null
           ? null
           : (convo, body, {required force, required pushKind}) async {
@@ -164,6 +193,7 @@ class _Rig {
   }
 
   final migrationCalls = <({bool force, String pushKind})>[];
+  final ratchet = _FakeRatchet();
 
   final order = <String>[];
   late final _FakeApi api;
@@ -281,7 +311,7 @@ void main() {
       expect(rig.submittedDevices, ['bob-1', 'bob-2']);
     });
 
-    test('without allPeerDevices only the row device is addressed', () async {
+    test('a plain control reaches every device the directory knows', () async {
       final rig = _Rig(_oneToOne());
       rig.cache.setPeerDevices(
         'acc-bob',
@@ -290,7 +320,63 @@ void main() {
 
       await rig.sender.sendControl(_convoId, '{}');
 
+      expect(rig.submittedDevices, ['bob-1', 'bob-2']);
+    });
+
+    test('a plain control falls back to the row device with no directory',
+        () async {
+      final rig = _Rig(_oneToOne());
+
+      await rig.sender.sendControl(_convoId, '{}');
+
       expect(rig.submittedDevices, ['bob-1']);
+    });
+
+    test('toDeviceId still targets that one device', () async {
+      final rig = _Rig(_oneToOne());
+      rig.cache.setPeerDevices(
+        'acc-bob',
+        const [AccountDevice(deviceId: 'bob-1'), AccountDevice(deviceId: 'bob-2')],
+      );
+
+      await rig.sender.sendControl(_convoId, '{}', toDeviceId: 'bob-2');
+
+      expect(rig.submittedDevices, ['bob-2']);
+    });
+  });
+
+  group('a 1:1 that has to stay on ratchet', () {
+    const everyDevice = [
+      RatchetFanoutTarget(
+          accountId: 'acc-bob',
+          deviceId: 'bob-1',
+          ratchetKey: '',
+          x25519: [1]),
+      RatchetFanoutTarget(
+          accountId: 'acc-bob',
+          deviceId: 'bob-2',
+          ratchetKey: 'bob-2',
+          x25519: [2]),
+    ];
+
+    test('a rebuild request goes to every device', () async {
+      final rig = _Rig(_ratchetOneToOne(),
+          migrationOutcome: ControlMigrationOutcome.stayOnRatchet,
+          fanoutTargets: everyDevice);
+
+      await rig.sender.sendControl(_convoId, '{}', allPeerDevices: true);
+
+      expect(rig.ratchet.fanouts.single, everyDevice);
+    });
+
+    test('a plain control still goes only to the row device', () async {
+      final rig = _Rig(_ratchetOneToOne(),
+          migrationOutcome: ControlMigrationOutcome.stayOnRatchet,
+          fanoutTargets: everyDevice);
+
+      await rig.sender.sendControl(_convoId, '{}');
+
+      expect(rig.ratchet.fanouts, isEmpty);
     });
   });
 

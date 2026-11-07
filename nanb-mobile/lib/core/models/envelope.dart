@@ -43,6 +43,10 @@ class EnvelopeType {
   /// payload is an Ed25519-signed [DeliveredReceipt] the sender verifies. See
   /// `core/crypto/delivered_receipt.dart`.
   static const String deliveredReceipt = 'delivered_receipt';
+
+  /// A device that lost a group asking to be re-added, or to be sent what it
+  /// missed. Inner type of a sealed envelope; see `GroupRecoveryMessage`.
+  static const String groupRecovery = 'group_recovery';
 }
 
 @immutable

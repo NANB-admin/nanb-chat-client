@@ -93,6 +93,9 @@ class _FakeApiClient implements ApiClient {
 }
 
 class _RecordingCrypto implements CryptoBridge {
+  @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async => const {};
+
   /// Device ids passed to [removeMember], in call order.
   final List<String> removeMemberCalls = [];
 

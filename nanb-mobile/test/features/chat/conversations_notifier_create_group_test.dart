@@ -123,6 +123,9 @@ class _FakeApiClient implements ApiClient {
 
 class _RecordingCrypto implements CryptoBridge {
   @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) async => const {};
+
+  @override
   Future<bool> consumeMlsStoreReset() async => false;
 
   final List<String> createGroupCalls = [];

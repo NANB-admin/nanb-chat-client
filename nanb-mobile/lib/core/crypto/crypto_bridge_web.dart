@@ -176,6 +176,12 @@ class CryptoBridgeWeb implements CryptoBridge, MlsSeededBridge {
       (api) async => (await api.currentEpoch(groupId).toDart).toDartInt);
 
   @override
+  Future<Set<String>> groupMemberDeviceIds(String groupId) => _call((api) async {
+        final ids = await api.groupMembers(groupId).toDart;
+        return {for (final id in ids.toDart) id.toDart};
+      });
+
+  @override
   Future<List<int>> encrypt({
     required String groupId,
     required List<int> plaintext,

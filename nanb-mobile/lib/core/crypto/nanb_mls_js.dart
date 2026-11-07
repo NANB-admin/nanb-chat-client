@@ -28,6 +28,7 @@ extension type NanbMlsJs._(JSObject _) implements JSObject {
   external JSPromise<JSString> processWelcome(JSUint8Array welcome);
   external JSPromise<JSAny?> processCommit(String groupId, JSUint8Array commit);
   external JSPromise<JSNumber> currentEpoch(String groupId);
+  external JSPromise<JSArray<JSString>> groupMembers(String groupId);
   external JSPromise<JSUint8Array> encrypt(
     String groupId,
     JSUint8Array plaintext,

@@ -7,6 +7,7 @@
 ///   mls_decrypt_failed    -> MlsDecryptException
 ///   mls_io                -> MlsIoException
 ///   mls_invalid_argument  -> MlsArgumentException
+///   mls_orphan_welcome    -> MlsOrphanWelcomeException
 ///   anything else        -> MlsUnknownException (with original code)
 class MlsException implements Exception {
   const MlsException(this.message);
@@ -50,6 +51,13 @@ class MlsArgumentException extends MlsException {
   const MlsArgumentException(super.message);
   @override
   String toString() => 'MlsArgumentException: $message';
+}
+
+/// A Welcome this device can't open: its key package's private half is gone, so
+/// no retry can ever succeed. Nothing was changed by the attempt, so a group held
+/// under that id is still intact and must be kept.
+class MlsOrphanWelcomeException extends MlsArgumentException {
+  const MlsOrphanWelcomeException(super.message);
 }
 
 /// Fallback for unrecognised native error codes.

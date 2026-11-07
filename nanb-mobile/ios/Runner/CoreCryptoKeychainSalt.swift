@@ -57,45 +57,73 @@ enum CoreCryptoKeychainSalt {
     return status == errSecSuccess || status == errSecItemNotFound
   }
 
-  /// Re-files a salt orphaned by a store-PATH change under `path`'s account.
-  /// Returns true when it moved one (the caller then retries the open).
+  /// The salts filed under any path other than `path`, most recently modified
+  /// first, since the newest is the likeliest to belong to the live db file.
   ///
   /// The account is derived from the ABSOLUTE store path, which embeds the
-  /// Data-container UUID — and iOS does not promise that UUID survives an app
+  /// Data-container UUID, and iOS does not promise that UUID survives an app
   /// update. When it moves, the db file moves with the container but its salt
-  /// stays filed under the OLD path's hash, the open fails, and the purge that
-  /// follows threw away every MLS group the user had ("Couldn't find
-  /// conversation" on the next send to each one).
-  ///
-  /// Only acts on an unambiguous picture: exactly ONE `keystore_salt_` item for
-  /// another path. An item already under the current account is the one the
-  /// failed open just minted for a salt it couldn't find, so it is replaced.
-  /// Wrong guesses are harmless — the store was not opening anyway, and the
-  /// caller's purge still runs if the retry fails.
-  static func adoptOrphan(forStorePath path: String) -> Bool {
+  /// stays filed under the OLD path's hash, so the open fails.
+  static func orphans(forStorePath path: String) -> [String] {
     let current = account(forStorePath: path)
-    let listQuery: [String: Any] = [
+    let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
       kSecMatchLimit as String: kSecMatchLimitAll,
       kSecReturnAttributes as String: true,
     ]
     var found: CFTypeRef?
-    guard SecItemCopyMatching(listQuery as CFDictionary, &found) == errSecSuccess,
+    guard SecItemCopyMatching(query as CFDictionary, &found) == errSecSuccess,
       let items = found as? [[String: Any]]
-    else { return false }
-    let orphans = items
+    else { return [] }
+    return items
+      .filter { ($0[kSecAttrAccount as String] as? String)?.hasPrefix("keystore_salt_") == true }
+      .filter { ($0[kSecAttrAccount as String] as? String) != current }
+      .sorted {
+        let a = $0[kSecAttrModificationDate as String] as? Date ?? .distantPast
+        let b = $1[kSecAttrModificationDate as String] as? Date ?? .distantPast
+        return a > b
+      }
       .compactMap { $0[kSecAttrAccount as String] as? String }
-      .filter { $0.hasPrefix("keystore_salt_") && $0 != current }
-    guard orphans.count == 1, let orphan = orphans.first else { return false }
+  }
 
-    delete(forStorePath: path)
-    let match: [String: Any] = [
+  /// Files a COPY of the `orphan` salt under `path`'s account, replacing what is
+  /// there (the item a failed open minted for a salt it couldn't find). A copy so
+  /// a wrong candidate costs nothing: the caller just tries the next one.
+  static func adopt(orphan: String, forStorePath path: String) -> Bool {
+    let read: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
       kSecAttrAccount as String: orphan,
+      kSecReturnData as String: true,
     ]
-    let update: [String: Any] = [kSecAttrAccount as String: current]
-    return SecItemUpdate(match as CFDictionary, update as CFDictionary) == errSecSuccess
+    var found: CFTypeRef?
+    guard SecItemCopyMatching(read as CFDictionary, &found) == errSecSuccess,
+      let salt = found as? Data
+    else { return false }
+    delete(forStorePath: path)
+    let add: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: account(forStorePath: path),
+      kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+      kSecValueData as String: salt,
+    ]
+    return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+  }
+
+  /// Deletes every salt except `path`'s. Call only once `path`'s store has opened
+  /// or been purged: there is one store per install, so the rest are dead. They
+  /// outlive the app (the keychain survives a reinstall) and would otherwise pile
+  /// up, one per container move.
+  static func deleteOrphans(forStorePath path: String) {
+    for orphan in orphans(forStorePath: path) {
+      let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: orphan,
+      ]
+      SecItemDelete(query as CFDictionary)
+    }
   }
 }

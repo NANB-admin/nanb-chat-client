@@ -50,6 +50,57 @@ class _FakeCrypto extends CryptoBridgeStub {
 }
 
 void main() {
+  test('replaceIfStoreWasReset replaces the pool after a store rebuild',
+      () async {
+    final api = _RecordingApi();
+
+    await KeyPackageReplenisher(api: api, crypto: _FakeCrypto(storeReset: true))
+        .replaceIfStoreWasReset();
+
+    expect(api.published, isNotEmpty);
+  });
+
+  test('a suspect pool is replaced with a reset publish', () async {
+    final api = _RecordingApi();
+
+    await KeyPackageReplenisher(api: api, crypto: _FakeCrypto())
+        .replaceSuspectPool();
+
+    expect(api.published.single.reset, isTrue);
+  });
+
+  test('concurrent replacements publish once', () async {
+    final api = _RecordingApi();
+    final replenisher =
+        KeyPackageReplenisher(api: api, crypto: _FakeCrypto(storeReset: true));
+
+    await Future.wait([
+      replenisher.replaceIfStoreWasReset(),
+      replenisher.replaceIfStoreWasReset(),
+    ]);
+
+    expect(api.published, hasLength(1));
+  });
+
+  test('a suspect pool is replaced at most once per cooldown', () async {
+    final api = _RecordingApi();
+    final replenisher = KeyPackageReplenisher(api: api, crypto: _FakeCrypto());
+
+    await replenisher.replaceSuspectPool();
+    await replenisher.replaceSuspectPool();
+
+    expect(api.published, hasLength(1));
+  });
+
+  test('replaceIfStoreWasReset leaves a healthy pool alone', () async {
+    final api = _RecordingApi();
+
+    await KeyPackageReplenisher(api: api, crypto: _FakeCrypto())
+        .replaceIfStoreWasReset();
+
+    expect(api.published, isEmpty);
+  });
+
   test('a full pool is left alone', () async {
     final api = _RecordingApi(count: 100);
     await KeyPackageReplenisher(api: api, crypto: _FakeCrypto())

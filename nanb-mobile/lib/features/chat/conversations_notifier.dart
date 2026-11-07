@@ -4480,7 +4480,7 @@ class ConversationsNotifier extends ChangeNotifier
               conversationId: convo.id, newDevice: device, keyPackage: kp);
         } else {
           await _addDeviceToOneToOneGroup(
-              convo.id, session.accountId, device.deviceId, kp, members);
+              convo.id, session.accountId, device.deviceId, kp);
         }
       } catch (e) {
         debugPrint('reconcile: add ${device.deviceId} to ${convo.id} failed: $e');
@@ -4548,18 +4548,29 @@ class ConversationsNotifier extends ChangeNotifier
   }
 
   /// Adds one of our OWN devices to an existing MLS 1:1 group: Welcome to the
-  /// device, Commit to every current member in [members], so the newcomer joins
-  /// at the post-add epoch.
+  /// device, Commit to every device in the group at that moment, so the newcomer
+  /// joins at the post-add epoch.
   Future<void> _addDeviceToOneToOneGroup(
     String conversationId,
     String myAccountId,
     String newDeviceId,
     List<int> keyPackage,
-    Set<String> members,
   ) async {
     await _runLocked(conversationId, () async {
       final convo = _byId[conversationId];
       if (convo == null || convo.cryptoMode != CryptoMode.mls) return;
+      // Read the members NOW, inside the lock. A list taken at the start of the
+      // sweep goes stale after the first add: the second add's Commit then
+      // skipped the device just added, which fell an epoch behind and forked
+      // the group by adding the same device again (seen on nanb4, build 54).
+      final Set<String> members;
+      try {
+        members = await _crypto.groupMemberDeviceIds(conversationId);
+      } catch (_) {
+        return;
+      }
+      // Another of our devices got there first.
+      if (members.contains(newDeviceId)) return;
       final r = await _crypto.addMember(
           groupId: conversationId, peerKeyPackage: keyPackage);
       // Welcome to the new device.

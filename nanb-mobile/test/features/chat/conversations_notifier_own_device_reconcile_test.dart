@@ -155,11 +155,14 @@ class _RecordingCrypto implements CryptoBridge {
   Future<AddMemberResult> addMember({
     required String groupId,
     required List<int> peerKeyPackage,
-  }) async =>
-      AddMemberResult(
-        welcome: List<int>.filled(8, 0xAA),
-        commit: List<int>.filled(8, 0xCC),
-      );
+  }) async {
+    final m = members;
+    if (m != null) members = {...m, utf8.decode(peerKeyPackage)};
+    return AddMemberResult(
+      welcome: List<int>.filled(8, 0xAA),
+      commit: List<int>.filled(8, 0xCC),
+    );
+  }
 
   @override
   Future<int> currentEpoch(String groupId) async => currentEpochResult;
@@ -437,8 +440,9 @@ Device _device(String id, {String? linkedBy}) => Device(
       linkedByDeviceId: linkedBy,
     );
 
+/// The package carries its device id, so the fake group can grow on addMember.
 DeviceKeyPackageResult _kp(String deviceId) =>
-    DeviceKeyPackageResult(deviceId: deviceId, keyPackage: const [9]);
+    DeviceKeyPackageResult(deviceId: deviceId, keyPackage: utf8.encode(deviceId));
 
 GroupMember _member(String accountId, String deviceId,
         {bool isSelf = false}) =>
@@ -653,6 +657,32 @@ void main() {
         members: null,
       );
       expect(welcomesTo('other'), isEmpty);
+    });
+
+    test('the second add tells the device the first add brought in', () async {
+      await connectWith(
+        devices: [_device('self-dev'), _device('a-missing'), _device('b-missing')],
+        kps: [_kp('a-missing'), _kp('b-missing')],
+        convos: [_oneToOne()],
+      );
+      final commitsToA = api.submittedMessages.where((p) =>
+          p.envelopeType == EnvelopeType.mlsHandshake &&
+          p.recipientDeviceId == 'a-missing');
+      expect(commitsToA, hasLength(1));
+    });
+
+    test('a device another of ours already added is not added again', () async {
+      await connectWith(
+        devices: [_device('self-dev'), _device('missing')],
+        kps: [_kp('missing')],
+        convos: [_oneToOne()],
+        members: {'self-dev', 'peer-dev'},
+      );
+      final welcomes = welcomesTo('missing').length;
+      crypto.members = {'self-dev', 'missing', 'peer-dev'};
+      supervisor.emitReconnected();
+      await pumpEventQueue();
+      expect(welcomesTo('missing'), hasLength(welcomes));
     });
 
     test('the Commit goes only to devices really in the group', () async {

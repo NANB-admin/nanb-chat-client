@@ -5,6 +5,7 @@ import '../models/forward_marker.dart';
 import '../models/message_kind.dart';
 import '../models/reply_ref.dart';
 import '../models/ttl_header.dart';
+import '../models/view_once_header.dart';
 
 /// Rebuilds the wire body of a message this device already sent, from its stored
 /// row, with the headers in the same order the original send used (client id,
@@ -28,6 +29,7 @@ String? buildResendWireBody(ChatMessage message, {required DateTime now}) {
         ).encodePrefix() +
         body;
   }
+  if (message.viewOnce) body = ViewOnceHeader.prefix + body;
   final expiresAt = message.expiresAt;
   if (expiresAt != null) {
     final remaining = expiresAt.difference(now).inSeconds;

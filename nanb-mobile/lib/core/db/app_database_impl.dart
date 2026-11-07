@@ -65,7 +65,7 @@ class AppDatabaseImpl implements AppDatabase {
     return openDatabase(
       dbPath,
       password: masterKeyHex,
-      version: 33,
+      version: 34,
       // WAL + synchronous=NORMAL. The catchup drain is the write-heaviest thing
       // this app does — one transaction per inbound message, each of which
       // under the default rollback journal costs a journal write plus a full
@@ -428,6 +428,17 @@ class AppDatabaseImpl implements AppDatabase {
                 'ALTER TABLE conversations ADD COLUMN group_avatar TEXT');
           } catch (_) {/* already exists */}
         }
+        if (oldVersion < 34) {
+          // v34: view-once messages. No index uses these (see above).
+          try {
+            await db.execute('ALTER TABLE messages ADD COLUMN view_once '
+                'INTEGER NOT NULL DEFAULT 0');
+          } catch (_) {/* already exists */}
+          try {
+            await db.execute(
+                'ALTER TABLE messages ADD COLUMN view_once_opened_at INTEGER');
+          } catch (_) {/* already exists */}
+        }
       },
     );
   }
@@ -656,6 +667,9 @@ class AppDatabaseImpl implements AppDatabase {
         'edited': m.edited ? 1 : 0,
         'delivered_at': m.deliveredAt?.toUtc().millisecondsSinceEpoch,
         'read_at': m.readAt?.toUtc().millisecondsSinceEpoch,
+        'view_once': m.viewOnce ? 1 : 0,
+        'view_once_opened_at':
+            m.viewOnceOpenedAt?.toUtc().millisecondsSinceEpoch,
       };
 
   @override
@@ -896,7 +910,9 @@ class AppDatabaseImpl implements AppDatabase {
         link_preview TEXT,
         edited INTEGER NOT NULL DEFAULT 0,
         delivered_at INTEGER,
-        read_at INTEGER
+        read_at INTEGER,
+        view_once INTEGER NOT NULL DEFAULT 0,
+        view_once_opened_at INTEGER
       )
     ''');
     await db.execute(
@@ -1272,6 +1288,8 @@ class AppDatabaseImpl implements AppDatabase {
       edited: ((row['edited'] as int?) ?? 0) == 1,
       deliveredAt: _msToUtc(row['delivered_at'] as int?),
       readAt: _msToUtc(row['read_at'] as int?),
+      viewOnce: ((row['view_once'] as int?) ?? 0) == 1,
+      viewOnceOpenedAt: _msToUtc(row['view_once_opened_at'] as int?),
     );
   }
 

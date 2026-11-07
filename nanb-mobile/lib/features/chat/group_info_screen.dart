@@ -415,7 +415,8 @@ class GroupInfoScreen extends ConsumerWidget {
       builder: (_) => AlertDialog(
         title: const Text('Leave this group?'),
         content: const Text(
-          "You won't be able to see new messages. Existing messages stay on your device.",
+          "You won't get new messages, and this chat will be deleted from "
+          'your devices.',
         ),
         actions: [
           TextButton(

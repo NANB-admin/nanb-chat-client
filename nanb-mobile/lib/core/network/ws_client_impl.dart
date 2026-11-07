@@ -272,6 +272,7 @@ class WsClientImpl implements WsClient {
   Future<List<Envelope>> catchupOverSocket(
     String clientRef, {
     int? limit,
+    DateTime? since,
     Duration timeout = const Duration(seconds: 10),
   }) {
     final ch = _channel;
@@ -284,6 +285,7 @@ class WsClientImpl implements WsClient {
         'type': 'catchup',
         'client_ref': clientRef,
         'limit': ?limit,
+        'since_server_ts': ?since?.toUtc().toIso8601String(),
       }));
     } catch (_) {
       _pendingCatchups.remove(clientRef);

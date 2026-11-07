@@ -268,8 +268,9 @@ class SettingsHubScreen extends ConsumerWidget {
           title: const Text('Delete account?'),
           content: const Text(
             'This deletes your account on the server (your username is '
-            'reserved for 30 days) and wipes your local chat history, '
-            'identity keypair, and JWT on this device.',
+            'reserved for 30 days) and wipes your chat history and keys on '
+            'this device. You leave every group, and your chats are deleted '
+            'from the devices of everyone you talked to.',
           ),
           actions: [
             TextButton(
@@ -284,6 +285,12 @@ class SettingsHubScreen extends ConsumerWidget {
         ),
       );
       if (confirmed == true && context.mounted) {
+        // Tell every 1:1 contact FIRST, while the keys to reach them still
+        // exist: their devices delete the chat with this account.
+        try {
+          await ref.read(conversationsProvider).notifyContactsOfAccountDeletion();
+        } catch (_) {/* best-effort — deletion must still proceed */}
+        if (!context.mounted) return;
         // Leave every group BEFORE the account is deleted: removal commits
         // are sent with this session's JWT, and the server can't evict us
         // itself (it never sees MLS membership) — skipping this leaves a

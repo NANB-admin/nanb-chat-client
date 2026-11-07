@@ -649,6 +649,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
             myDeviceId: session.deviceId,
             text: text,
             replyTo: replyTo,
+            viewOnce: _takeViewOnce(),
           )
           .catchError((Object e) {
             if (mounted) _showSendError(e);
@@ -803,6 +804,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
         _showError('No active session.');
         return;
       }
+      final viewOnce = _takeViewOnce();
       for (var n = 0; n < images.length; n++) {
         await ref.read(conversationsProvider).sendImage(
               conversationId: widget.conversationId,
@@ -810,6 +812,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
               imageBytes: images[n].bytes,
               mimeType: images[n].mime,
               caption: captions[n],
+              viewOnce: viewOnce,
             );
       }
     } catch (e) {
@@ -846,6 +849,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
         imageBytes: bytes,
         mimeType: mimeType,
         caption: caption,
+        viewOnce: _takeViewOnce(),
       );
     } catch (_) {
       // Restore the caption after failure without overwriting a newer draft.
@@ -1164,6 +1168,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
             videoBytes: bytes,
             mimeType: picked.mimeType ?? 'video/mp4',
             caption: caption,
+            viewOnce: _takeViewOnce(),
           );
       _composer.clear();
     } catch (e) {
@@ -1172,6 +1177,16 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
       messenger.hideCurrentSnackBar();
       if (mounted) setState(() => _attachBusy = false);
     }
+  }
+
+  /// The view-once toggle for the next send. It applies to one message and
+  /// turns itself off, like WhatsApp's.
+  bool _viewOnce = false;
+
+  bool _takeViewOnce() {
+    final on = _viewOnce;
+    if (on && mounted) setState(() => _viewOnce = false);
+    return on;
   }
 
   Future<void> _recordAndSendVoice() async {
@@ -1198,6 +1213,7 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
             durationMs: recording.duration == Duration.zero
                 ? null
                 : recording.duration.inMilliseconds,
+            viewOnce: _takeViewOnce(),
           );
       try {
         await file.delete();
@@ -1604,6 +1620,10 @@ class _ChatThreadScreenState extends ConsumerState<ChatThreadScreen> {
                           onMic: _attachBusy ? null : _recordAndSendVoice,
                           onEmoji: _toggleEmojiPanel,
                           emojiOpen: _showEmojiPanel,
+                          viewOnce: _viewOnce,
+                          onToggleViewOnce: isGroup
+                              ? null
+                              : () => setState(() => _viewOnce = !_viewOnce),
                         ),
                         // Inline emoji panel: sits below the composer (in
                         // place of the keyboard) so the text field stays

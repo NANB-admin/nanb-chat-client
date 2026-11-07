@@ -76,4 +76,44 @@ void main() {
 
     expect(micced, 1);
   });
+
+  group('view once', () {
+    Future<void> pumpWithToggle(WidgetTester tester,
+        {bool on = false, VoidCallback? onToggle}) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: ChatComposer(
+              controller: TextEditingController(),
+              onSend: () {},
+              viewOnce: on,
+              onToggleViewOnce: onToggle,
+            ),
+          ),
+        ),
+      );
+    }
+
+    testWidgets('the toggle is hidden without a handler', (tester) async {
+      await pumpWithToggle(tester);
+
+      expect(find.bySemanticsLabel('View once'), findsNothing);
+    });
+
+    testWidgets('tapping the toggle flips it', (tester) async {
+      var flips = 0;
+      await pumpWithToggle(tester, onToggle: () => flips++);
+
+      await tester.tap(find.bySemanticsLabel('View once'));
+
+      expect(flips, 1);
+    });
+
+    testWidgets('when on, the field says the message is view once',
+        (tester) async {
+      await pumpWithToggle(tester, on: true, onToggle: () {});
+
+      expect(find.text('View once message…'), findsOneWidget);
+    });
+  });
 }

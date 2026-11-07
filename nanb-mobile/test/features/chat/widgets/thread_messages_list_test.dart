@@ -23,6 +23,20 @@ class _NoopNotifier extends ChangeNotifier implements ConversationsNotifier {
   @override
   String get myAccountId => '';
 
+  final deletedForMe = <String>[];
+  final deletedForEveryone = <String>[];
+
+  @override
+  Future<void> deleteMessageForMe(String conversationId, ChatMessage m) async =>
+      deletedForMe.add(m.envelopeId);
+
+  @override
+  Future<void> unsendMessage({
+    required String conversationId,
+    required ChatMessage target,
+  }) async =>
+      deletedForEveryone.add(target.envelopeId);
+
   @override
   dynamic noSuchMethod(Invocation invocation) =>
       super.noSuchMethod(invocation);
@@ -48,6 +62,7 @@ Widget _host(
   ValueChanged<String>? onJumpToMessageId,
   bool peerTyping = false,
   ValueChanged<ChatMessage>? onEdit,
+  _NoopNotifier? notifier,
 }) =>
     MaterialApp(
       theme: buildLightTheme(),
@@ -57,7 +72,7 @@ Widget _host(
           hasMoreOlderMessages: false,
           scrollController: ScrollController(),
           t: DesignTokens.light,
-          notifier: _NoopNotifier(),
+          notifier: notifier ?? _NoopNotifier(),
           isGroup: false,
           members: const <GroupMember>[],
           onReply: (_) {},
@@ -195,6 +210,58 @@ void main() {
       await tester.pump();
 
       expect(find.byType(SenderNameLabel), findsNothing);
+    });
+  });
+
+  group('deleting a message', () {
+    Future<_NoopNotifier> openMenuAndPick(WidgetTester tester, String choice) async {
+      final notifier = _NoopNotifier();
+      await tester.pumpWidget(_host([_ownMsg()], notifier: notifier));
+      await tester.pump();
+      await tester.longPress(find.text('my words'));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text(choice));
+      await tester.tap(find.text(choice));
+      await tester.pumpAndSettle();
+      return notifier;
+    }
+
+    testWidgets('Delete for me asks first', (tester) async {
+      final notifier = await openMenuAndPick(tester, 'Delete for me');
+
+      expect(find.text('Delete for you?'), findsOneWidget);
+      expect(notifier.deletedForMe, isEmpty);
+    });
+
+    testWidgets('Delete for me happens once confirmed', (tester) async {
+      final notifier = await openMenuAndPick(tester, 'Delete for me');
+      await tester.tap(find.text('Delete'));
+      await tester.pumpAndSettle();
+
+      expect(notifier.deletedForMe, ['env-own']);
+    });
+
+    testWidgets('cancelling Delete for me keeps the message', (tester) async {
+      final notifier = await openMenuAndPick(tester, 'Delete for me');
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+
+      expect(notifier.deletedForMe, isEmpty);
+    });
+
+    testWidgets('Delete for everyone asks first', (tester) async {
+      final notifier = await openMenuAndPick(tester, 'Delete for everyone');
+
+      expect(find.text('Delete for everyone?'), findsOneWidget);
+      expect(notifier.deletedForEveryone, isEmpty);
+    });
+
+    testWidgets('Delete for everyone happens once confirmed', (tester) async {
+      final notifier = await openMenuAndPick(tester, 'Delete for everyone');
+      await tester.tap(find.text('Delete'));
+      await tester.pumpAndSettle();
+
+      expect(notifier.deletedForEveryone, ['env-own']);
     });
   });
 

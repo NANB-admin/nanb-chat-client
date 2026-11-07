@@ -16,6 +16,7 @@ import '../models/privacy_header.dart';
 import '../models/reply_ref.dart';
 import '../models/system_event.dart';
 import '../models/ttl_header.dart';
+import '../models/view_once_header.dart';
 import 'control_receiver.dart';
 import 'control_sender.dart';
 import 'notifier_service_host.dart';
@@ -121,9 +122,12 @@ class MessageAppender {
     final privSplit = PrivacyHeader.split(afterTtl);
     final PrivacyHeader? privHeader = privSplit?.$1;
     final afterPriv = privSplit?.$2 ?? afterTtl;
-    final replySplit = ReplyRef.split(afterPriv);
+    final afterOnce = ViewOnceHeader.split(afterPriv);
+    final bool viewOnce = afterOnce != null;
+    final afterViewOnce = afterOnce ?? afterPriv;
+    final replySplit = ReplyRef.split(afterViewOnce);
     final ReplyRef? replyRef = replySplit?.$1;
-    final afterReply = replySplit?.$2 ?? afterPriv;
+    final afterReply = replySplit?.$2 ?? afterViewOnce;
     final fwdRemainder = ForwardMarker.split(afterReply);
     final bool forwarded = fwdRemainder != null;
     final wireBody = fwdRemainder ?? afterReply;
@@ -247,7 +251,9 @@ class MessageAppender {
       clientMsgId: clientMsgId,
       body: body,
       serverTs: env.serverTs,
-      expiresAt: msgExpiresAt,
+      expiresAt: viewOnce
+          ? ViewOnceHeader.expiry(env.serverTs, msgExpiresAt)
+          : msgExpiresAt,
       mine: mine,
       kind: kind,
       mediaId: mediaId,
@@ -262,6 +268,7 @@ class MessageAppender {
       replyToSender: replyRef?.sender,
       replyToPreview: replyRef?.preview,
       forwarded: forwarded,
+      viewOnce: viewOnce,
     );
 
     // Re-read the Conversation — it may have been mutated by a concurrent send

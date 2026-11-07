@@ -14,6 +14,7 @@ import 'models/conversation_kind.dart';
 import 'models/message_kind.dart';
 import 'models/system_event.dart';
 import 'services/sticker_marker.dart';
+import 'widgets/view_once_bubble.dart';
 import 'widgets/connection_banner.dart';
 import 'media_pipeline.dart';
 import 'widgets/avatar_image.dart';
@@ -235,9 +236,8 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
               ? 'This deletes the group and all its messages for every member, '
                   'on all of their devices. This cannot be undone.'
               : isGroup
-              ? "Deletes the messages from this device only. You're still a "
-                  'member — leave the group first if you no longer want new '
-                  'messages.'
+              ? "You'll leave the group and its messages will be deleted "
+                  'from your devices.'
               : 'Deletes the messages from this device only. $name is not '
                   'notified and can still message you, which starts a new '
                   'conversation.',
@@ -972,9 +972,11 @@ class _LastRow extends StatelessWidget {
         ? '(no messages)'
         : isSystem
             ? (SystemEvent.tryDecode(last.body)?.displayText ?? '')
-            : StickerMarker.isSticker(last)
-                ? '🏷️ Sticker'
-                : last.body;
+            : last.viewOnce
+                ? ViewOnceBubble.label(last)
+                : StickerMarker.isSticker(last)
+                    ? '🏷️ Sticker'
+                    : last.body;
     // WhatsApp-style: an outgoing last message shows its delivery ticks in
     // place of the old "You:" label; incoming / system rows are unchanged.
     final isMine = last?.mine == true && !isSystem;

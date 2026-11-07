@@ -6,6 +6,7 @@ import 'package:nanb_chat/features/chat/models/forward_marker.dart';
 import 'package:nanb_chat/features/chat/models/message_kind.dart';
 import 'package:nanb_chat/features/chat/models/reply_ref.dart';
 import 'package:nanb_chat/features/chat/models/ttl_header.dart';
+import 'package:nanb_chat/features/chat/models/view_once_header.dart';
 import 'package:nanb_chat/features/chat/services/resend_wire_body.dart';
 
 final _now = DateTime.utc(2026, 11, 6, 12);
@@ -18,6 +19,7 @@ ChatMessage _message({
   bool forwarded = false,
   String? replyToEnvelopeId,
   String? mediaId,
+  bool viewOnce = false,
 }) =>
     ChatMessage(
       envelopeId: 'env-1',
@@ -38,6 +40,7 @@ ChatMessage _message({
       mediaSha256: mediaId == null ? null : const [3, 4],
       mediaSize: mediaId == null ? null : 10,
       mediaMime: mediaId == null ? null : 'image/png',
+      viewOnce: viewOnce,
     );
 
 void main() {
@@ -52,6 +55,12 @@ void main() {
       final wire = buildResendWireBody(_message(), now: _now)!;
 
       expect(ClientMsgIdHeader.split(wire)!.$2, 'hello');
+    });
+
+    test('a view-once message is re-sent as view once', () {
+      final wire = buildResendWireBody(_message(viewOnce: true), now: _now)!;
+
+      expect(ClientMsgIdHeader.split(wire)!.$2, '${ViewOnceHeader.prefix}hello');
     });
 
     test('returns null without a client message id', () {

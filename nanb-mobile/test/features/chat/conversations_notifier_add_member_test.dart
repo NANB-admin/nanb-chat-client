@@ -279,6 +279,7 @@ class _FakeWs implements WsClient {
   Future<List<Envelope>> catchupOverSocket(
     String clientRef, {
     int? limit,
+    DateTime? since,
     Duration timeout = const Duration(seconds: 10),
   }) async =>
       throw const WsNotConnectedException();

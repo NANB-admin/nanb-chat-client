@@ -16,6 +16,8 @@ class ChatComposer extends StatefulWidget {
     this.emojiOpen = false,
     this.focusNode,
     this.placeholder = 'Type a message…',
+    this.viewOnce = false,
+    this.onToggleViewOnce,
   });
 
   final TextEditingController controller;
@@ -42,6 +44,12 @@ class ChatComposer extends StatefulWidget {
   final FocusNode? focusNode;
 
   final String placeholder;
+
+  /// Whether the next message goes out "view once".
+  final bool viewOnce;
+
+  /// Flips [viewOnce]. Null hides the button (groups).
+  final VoidCallback? onToggleViewOnce;
 
   @override
   State<ChatComposer> createState() => _ChatComposerState();
@@ -114,7 +122,9 @@ class _ChatComposerState extends State<ChatComposer> {
                       maxLines: 6,
                       style: TextStyle(fontSize: 14, color: t.text),
                       decoration: InputDecoration(
-                        hintText: widget.placeholder,
+                        hintText: widget.viewOnce
+                            ? 'View once message…'
+                            : widget.placeholder,
                         hintStyle: TextStyle(color: t.textFaint),
                         border: InputBorder.none,
                         isDense: true,
@@ -122,6 +132,26 @@ class _ChatComposerState extends State<ChatComposer> {
                       ),
                     ),
                   ),
+                  if (widget.onToggleViewOnce != null)
+                    Semantics(
+                      button: true,
+                      toggled: widget.viewOnce,
+                      label: 'View once',
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: widget.onToggleViewOnce,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 2),
+                          child: Icon(
+                            widget.viewOnce
+                                ? Icons.looks_one
+                                : Icons.looks_one_outlined,
+                            size: 18,
+                            color: widget.viewOnce ? t.accent : t.textMuted,
+                          ),
+                        ),
+                      ),
+                    ),
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
                     onTap: widget.onEmoji,

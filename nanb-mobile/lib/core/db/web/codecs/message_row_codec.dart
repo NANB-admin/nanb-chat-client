@@ -44,6 +44,9 @@ abstract final class MessageRowCodec {
         'edited': RowValues.boolInt(m.edited),
         'delivered_at': m.deliveredAt?.toUtc().millisecondsSinceEpoch,
         'read_at': m.readAt?.toUtc().millisecondsSinceEpoch,
+        'view_once': RowValues.boolInt(m.viewOnce),
+        'view_once_opened_at':
+            m.viewOnceOpenedAt?.toUtc().millisecondsSinceEpoch,
       };
 
   static ChatMessage decode(WebRow row) {
@@ -85,6 +88,8 @@ abstract final class MessageRowCodec {
       edited: RowValues.flag(row['edited']),
       deliveredAt: RowValues.msToUtc(row['delivered_at']),
       readAt: RowValues.msToUtc(row['read_at']),
+      viewOnce: RowValues.flag(row['view_once']),
+      viewOnceOpenedAt: RowValues.msToUtc(row['view_once_opened_at']),
     );
   }
 

@@ -4,6 +4,8 @@ import '../models/chat_message.dart';
 import '../models/conversation_kind.dart';
 import '../models/message_control.dart';
 import '../models/system_event.dart';
+import 'account_deletion_notice.dart';
+import 'view_once_service.dart';
 import 'conversation_delete_sync_service.dart';
 import 'conversation_state_applier.dart';
 import 'delete_sync_service.dart';
@@ -38,6 +40,8 @@ class ControlReceiver {
     required DeleteSyncService deleteSync,
     required ConversationStateApplier stateApplier,
     required ConversationDeleteSyncService conversationDeleteSync,
+    AccountDeletionNotice? accountDeletionNotice,
+    ViewOnceService? viewOnce,
     required GroupDisbandService groupDisband,
     required Future<void> Function(String conversationId, ChatMessage message)
         deleteMessageLocal,
@@ -55,6 +59,8 @@ class ControlReceiver {
         _deleteSync = deleteSync,
         _stateApplier = stateApplier,
         _conversationDeleteSync = conversationDeleteSync,
+        _accountDeletionNotice = accountDeletionNotice,
+        _viewOnce = viewOnce,
         _groupDisband = groupDisband,
         _deleteMessageLocal = deleteMessageLocal,
         _appendSystemEvent = appendSystemEvent;
@@ -71,6 +77,8 @@ class ControlReceiver {
   final DeleteSyncService _deleteSync;
   final ConversationStateApplier _stateApplier;
   final ConversationDeleteSyncService _conversationDeleteSync;
+  final AccountDeletionNotice? _accountDeletionNotice;
+  final ViewOnceService? _viewOnce;
   final GroupDisbandService _groupDisband;
   final Future<void> Function(String, ChatMessage) _deleteMessageLocal;
   final Future<void> Function(String, SystemEvent) _appendSystemEvent;
@@ -182,6 +190,25 @@ class ControlReceiver {
       // A sibling device of OURS changed per-chat state (LWW per field). The
       // applier honors it only from an own device and never re-broadcasts.
       await _stateApplier.applyInbound(
+        conversationId: conversationId,
+        control: control,
+        senderDeviceId: senderDeviceId,
+        myDeviceId: myDeviceId,
+      );
+      return;
+    }
+    if (control.isViewOnceOpened) {
+      await _viewOnce?.applyInbound(
+        conversationId: conversationId,
+        control: control,
+        senderDeviceId: senderDeviceId,
+        myDeviceId: myDeviceId,
+      );
+      return;
+    }
+    if (control.isAccountDeleted) {
+      // The peer is deleting their account: their chat goes too.
+      await _accountDeletionNotice?.applyInbound(
         conversationId: conversationId,
         control: control,
         senderDeviceId: senderDeviceId,

@@ -7,6 +7,7 @@ import '../models/privacy_header.dart';
 import '../models/reply_ref.dart';
 import '../models/system_event.dart';
 import '../models/ttl_header.dart';
+import '../models/view_once_header.dart';
 
 /// Whether a decrypted body is a message the user would see, rather than one
 /// of the payloads that only steer the app (receipts, read position, calls,
@@ -19,6 +20,7 @@ class VisiblePayload {
     var body = ClientMsgIdHeader.split(raw)?.$2 ?? raw;
     body = TtlHeader.split(body)?.$2 ?? body;
     body = PrivacyHeader.split(body)?.$2 ?? body;
+    body = ViewOnceHeader.split(body) ?? body;
     body = ReplyRef.split(body)?.$2 ?? body;
     body = ForwardMarker.split(body) ?? body;
     return MessageControl.tryDecode(body) == null &&

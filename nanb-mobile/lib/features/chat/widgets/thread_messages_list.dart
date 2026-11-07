@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
@@ -28,6 +29,9 @@ import 'message_info_sheet.dart';
 import 'message_bubble_file.dart';
 import 'reaction_chips.dart';
 import 'sticker_bubble.dart';
+import 'confirm_message_delete_dialog.dart';
+import 'view_once_bubble.dart';
+import 'view_once_viewer.dart';
 import 'typing_bubble.dart';
 import 'thread_media_bubbles.dart';
 
@@ -383,7 +387,14 @@ class _MessagesListState extends State<MessagesList> {
 
     // Render bubble.
     Widget bubble;
-    if (StickerMarker.isSticker(m)) {
+    if (m.viewOnce) {
+      bubble = ViewOnceBubble(
+        message: m,
+        time: _hhmm(m.serverTs),
+        onOpen: _canOpenViewOnce(m) ? () => _openViewOnce(context, m) : null,
+        onRetry: m.failed ? () => _retryFailedSend(context, m) : null,
+      );
+    } else if (StickerMarker.isSticker(m)) {
       bubble = StickerBubbleAsync(message: m, notifier: widget.notifier);
     } else if (m.kind == MessageKind.image) {
       bubble = ImageBubbleAsync(message: m, notifier: widget.notifier);
@@ -467,7 +478,7 @@ class _MessagesListState extends State<MessagesList> {
         m.kind == MessageKind.video ||
         m.kind == MessageKind.voice ||
         m.kind == MessageKind.file;
-    if (m.mine && isMedia) {
+    if (m.mine && isMedia && !m.viewOnce) {
       bubble = MediaBubbleStatusWrap(
         uploading: m.uploading,
         failed: m.failed,
@@ -602,6 +613,26 @@ class _MessagesListState extends State<MessagesList> {
   }
 
   /// Long-press menu for a message: retry (if failed), delete for me, and —
+  /// The recipient's unopened copy, on a device that can show it. The web client
+  /// can't play video or voice, so those stay closed there rather than be spent.
+  bool _canOpenViewOnce(ChatMessage m) =>
+      !m.mine &&
+      m.viewOnceOpenedAt == null &&
+      !(kIsWeb && (m.kind == MessageKind.video || m.kind == MessageKind.voice));
+
+  Future<void> _openViewOnce(BuildContext context, ChatMessage m) async {
+    final content =
+        await widget.notifier.openViewOnce(m.conversationId, m.envelopeId);
+    if (!context.mounted) return;
+    if (content == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Couldn't open it. Try again.")),
+      );
+      return;
+    }
+    await ViewOnceViewer.open(context, content);
+  }
+
   /// for your own already-sent messages — delete for everyone (unsend).
   void _showMessageActions(BuildContext context, ChatMessage m) {
     if (m.kind == MessageKind.system) return;
@@ -616,25 +647,32 @@ class _MessagesListState extends State<MessagesList> {
         convo != null &&
         convo.kind == ConversationKind.oneToOne &&
         convo.peerBlocksForwarding;
+    // A view-once message can only be opened (by tapping it) or deleted.
+    final viewOnce = m.viewOnce;
     final canCopy =
+        !viewOnce &&
         m.kind == MessageKind.text &&
         m.body.isNotEmpty &&
         !authorBlocksForwarding;
-    final canForward = !m.failed && !m.uploading && !authorBlocksForwarding;
+    final canForward =
+        !viewOnce && !m.failed && !m.uploading && !authorBlocksForwarding;
     final canSaveToGallery =
+        !viewOnce &&
         !m.uploading &&
         !m.failed &&
         (m.kind == MessageKind.image || m.kind == MessageKind.video);
     // Same bypass guard as Forward/Copy: an author who blocks forwarding doesn't
     // get their images collected into someone else's stickers either.
     final canAddToStickers = widget.onAddToStickers != null &&
+        !viewOnce &&
         m.kind == MessageKind.image &&
         !m.uploading &&
         !m.failed &&
         !authorBlocksForwarding;
     // Reactions target a server-acked message (the reaction control names its
     // envelope id), so only offer them once the message has a real id.
-    final canReact = m.envelopeId.isNotEmpty && !m.failed && reachedServer;
+    final canReact =
+        !viewOnce && m.envelopeId.isNotEmpty && !m.failed && reachedServer;
     showModalBottomSheet<void>(
       context: context,
       builder: (sheetContext) => SafeArea(
@@ -667,6 +705,7 @@ class _MessagesListState extends State<MessagesList> {
                   _retryFailedSend(context, m);
                 },
               ),
+            if (!viewOnce)
             ListTile(
               leading: const Icon(Icons.reply),
               title: const Text('Reply'),
@@ -675,7 +714,7 @@ class _MessagesListState extends State<MessagesList> {
                 widget.onReply(m);
               },
             ),
-            if (m.envelopeId.isNotEmpty && !m.failed && reachedServer)
+            if (!viewOnce && m.envelopeId.isNotEmpty && !m.failed && reachedServer)
               Builder(builder: (_) {
                 final isPinned = convo?.pinnedEnvelopeId == m.envelopeId;
                 final hasOtherPin =
@@ -713,7 +752,9 @@ class _MessagesListState extends State<MessagesList> {
                   MessageInfoSheet.show(context, m);
                 },
               ),
-            if (widget.onEdit != null && MessageEditService.canEdit(m))
+            if (!viewOnce &&
+                widget.onEdit != null &&
+                MessageEditService.canEdit(m))
               ListTile(
                 leading: const Icon(Icons.edit_outlined),
                 title: const Text('Edit'),
@@ -768,18 +809,24 @@ class _MessagesListState extends State<MessagesList> {
             ListTile(
               leading: const Icon(Icons.delete_outline),
               title: const Text('Delete for me'),
-              onTap: () {
+              onTap: () async {
                 Navigator.pop(sheetContext);
-                widget.notifier.deleteMessageForMe(m.conversationId, m);
+                if (!await confirmMessageDelete(context, forEveryone: false)) {
+                  return;
+                }
+                await widget.notifier.deleteMessageForMe(m.conversationId, m);
               },
             ),
             if (canUnsend)
               ListTile(
                 leading: const Icon(Icons.delete_forever),
                 title: const Text('Delete for everyone'),
-                onTap: () {
+                onTap: () async {
                   Navigator.pop(sheetContext);
-                  widget.notifier.unsendMessage(
+                  if (!await confirmMessageDelete(context, forEveryone: true)) {
+                    return;
+                  }
+                  await widget.notifier.unsendMessage(
                     conversationId: m.conversationId,
                     target: m,
                   );

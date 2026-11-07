@@ -87,9 +87,13 @@ abstract class WsClient {
   /// [WsSendException] on a `catchup_error` reply, [WsDisconnectedException] if
   /// the socket drops first, or [TimeoutException]. A drain is a pure READ, so
   /// unlike a send it is safe to retry over HTTP after ANY of these.
+  ///
+  /// [since] pages within one drain: the server returns unacked envelopes with
+  /// `server_ts >= since`, oldest first. Null starts at the oldest.
   Future<List<Envelope>> catchupOverSocket(
     String clientRef, {
     int? limit,
+    DateTime? since,
     Duration timeout = const Duration(seconds: 10),
   });
 

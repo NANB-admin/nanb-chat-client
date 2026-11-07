@@ -156,13 +156,18 @@ class _FakeWs implements WsClient {
   List<Envelope>? catchupOverSocketResult;
   int catchupOverSocketCalls = 0;
 
+  /// The `since` of every socket drain request, in order.
+  final List<DateTime?> catchupOverSocketSinces = [];
+
   @override
   Future<List<Envelope>> catchupOverSocket(
     String clientRef, {
     int? limit,
+    DateTime? since,
     Duration timeout = const Duration(seconds: 10),
   }) async {
     catchupOverSocketCalls++;
+    catchupOverSocketSinces.add(since);
     final r = catchupOverSocketResult;
     if (r == null) throw const WsNotConnectedException();
     return r;
@@ -8691,6 +8696,69 @@ void main() {
       expect(call, equals(1));
     });
 
+    // Live 2026-11-07: an iPhone had 370 unacked envelopes, the oldest 200 ones
+    // it could never open. Re-asking from the head returned those same 200 on
+    // every page, so everything queued behind them — every message that came
+    // in while the app was closed — was never fetched at all.
+    test('a full page that is never consumed does not hide what is queued '
+        'after it', () async {
+      await sessions.save(session);
+      final t0 = DateTime.utc(2026, 11, 1);
+      final queue = [
+        for (var i = 0; i < 200; i++)
+          _envelope(
+            envelopeId: 'dead-$i',
+            conversationId: '1to1:a:b',
+            serverTs: t0.add(Duration(seconds: i)),
+          ),
+        _envelope(
+          envelopeId: 'behind-the-wall',
+          conversationId: '1to1:a:b',
+          serverTs: t0.add(const Duration(days: 6)),
+        ),
+      ];
+      final returned = <String>{};
+      // The server: oldest first from `since` (inclusive), and nothing is ever
+      // consumed, so the head stays where it is.
+      when(() => api.catchupMessages(
+          since: any(named: 'since'),
+          limit: any(named: 'limit'))).thenAnswer((inv) async {
+        final since = inv.namedArguments[#since] as DateTime?;
+        final page = queue
+            .where((e) => since == null || !e.serverTs.isBefore(since))
+            .take(200)
+            .toList();
+        returned.addAll(page.map((e) => e.envelopeId));
+        return page;
+      });
+
+      await notifier.connect();
+      await pumpEventQueue();
+
+      expect(returned, contains('behind-the-wall'));
+    });
+
+    test('the socket drain asks for each next page from the newest envelope '
+        'of the page before', () async {
+      await sessions.save(session);
+      ws.connected = true;
+      final t0 = DateTime.utc(2026, 11, 1);
+      ws.catchupOverSocketResult = [
+        for (var i = 0; i < 200; i++)
+          _envelope(
+            envelopeId: 'p-$i',
+            conversationId: '1to1:a:b',
+            serverTs: t0.add(Duration(seconds: i)),
+          ),
+      ];
+
+      await notifier.connect();
+      await pumpEventQueue();
+
+      expect(ws.catchupOverSocketSinces.take(2),
+          [null, t0.add(const Duration(seconds: 199))]);
+    });
+
     test('catchup passes no `since` floor so offline->24h backlog is not lost', () async {
       // The server returns only unacked, unexpired envelopes; a client-side
       // time floor would silently drop anything missed while offline longer
@@ -9103,6 +9171,143 @@ void main() {
       expect(_stripCid(captured.ciphertext), '{"_ttl":3600}\nsecret');
       // Server retention matches the override too.
       expect(captured.ttlSeconds, 3600);
+    });
+  });
+
+  group('view once', () {
+    Future<String> startChat() async {
+      await sessions.save(session);
+      await notifier.connect();
+      when(() => api.lookupAccount(_peerUsername))
+          .thenAnswer((_) async => _peerAccount());
+      when(() => api.ackMessages(any())).thenAnswer((_) async => 1);
+      when(() => api.submitMessage(any())).thenAnswer((_) async =>
+          SubmitMessageResult(
+              envelopeId: 'env-sent', serverTs: DateTime.utc(2026, 11, 7)));
+      return notifier.startConversation(
+        myDeviceId: _myDeviceId,
+        username: _peerUsername,
+      );
+    }
+
+    Future<String> receiveViewOnce(String text) async {
+      final convoId = await startChat();
+      ws.push(_envelope(
+        conversationId: convoId,
+        senderDeviceId: 'peer-dev',
+        envelopeType: EnvelopeType.textLegacy,
+        envelopeId: 'env-once',
+        ciphertext: utf8.encode('{"_cid":"peer-cid-1"}\n{"_once":1}\n$text'),
+      ));
+      await pumpEventQueue();
+      return convoId;
+    }
+
+    test('a view-once send carries the marker', () async {
+      final convoId = await startChat();
+
+      await notifier.sendMessage(
+        conversationId: convoId,
+        myDeviceId: _myDeviceId,
+        text: 'secret',
+        viewOnce: true,
+      );
+
+      final captured = verify(() => api.submitMessage(captureAny()))
+          .captured
+          .last as SubmitMessagePayload;
+      expect(_stripCid(captured.ciphertext), '{"_once":1}\nsecret');
+    });
+
+    test('an ordinary send has no marker', () async {
+      final convoId = await startChat();
+
+      await notifier.sendMessage(
+        conversationId: convoId,
+        myDeviceId: _myDeviceId,
+        text: 'plain',
+      );
+
+      final captured = verify(() => api.submitMessage(captureAny()))
+          .captured
+          .last as SubmitMessagePayload;
+      expect(_stripCid(captured.ciphertext), 'plain');
+    });
+
+    test('a received view-once message is flagged', () async {
+      final convoId = await receiveViewOnce('secret');
+
+      expect(notifier.byId(convoId)!.messages.single.viewOnce, isTrue);
+    });
+
+    test('an unopened view-once message expires within 14 days', () async {
+      final convoId = await receiveViewOnce('secret');
+
+      final m = notifier.byId(convoId)!.messages.single;
+      expect(m.expiresAt, isNotNull);
+      expect(m.expiresAt!.difference(m.serverTs).inDays, lessThanOrEqualTo(14));
+    });
+
+    test('opening it hands over the content once', () async {
+      final convoId = await receiveViewOnce('secret');
+
+      final content = await notifier.openViewOnce(convoId, 'env-once');
+
+      expect(content!.text, 'secret');
+    });
+
+    test('opening it empties the message', () async {
+      final convoId = await receiveViewOnce('secret');
+
+      await notifier.openViewOnce(convoId, 'env-once');
+
+      final m = notifier.byId(convoId)!.messages.single;
+      expect(m.body, isEmpty);
+      expect(m.viewOnceOpenedAt, isNotNull);
+    });
+
+    test('it cannot be opened twice', () async {
+      final convoId = await receiveViewOnce('secret');
+      await notifier.openViewOnce(convoId, 'env-once');
+
+      expect(await notifier.openViewOnce(convoId, 'env-once'), isNull);
+    });
+
+    test('the sender is told it was opened', () async {
+      final convoId = await receiveViewOnce('secret');
+
+      await notifier.openViewOnce(convoId, 'env-once');
+      await pumpEventQueue();
+
+      final bodies = verify(() => api.submitMessage(captureAny()))
+          .captured
+          .cast<SubmitMessagePayload>()
+          .map((p) => utf8.decode(p.ciphertext));
+      expect(bodies.any((b) => b.contains('"view_once_opened"') &&
+          b.contains('peer-cid-1')), isTrue);
+    });
+
+    test('our own view-once message cannot be opened here', () async {
+      final convoId = await startChat();
+      await notifier.sendMessage(
+        conversationId: convoId,
+        myDeviceId: _myDeviceId,
+        text: 'secret',
+        viewOnce: true,
+      );
+      final mine = notifier.byId(convoId)!.messages.single;
+
+      expect(await notifier.openViewOnce(convoId, mine.envelopeId), isNull);
+    });
+
+    test('a view-once message cannot be forwarded', () async {
+      final convoId = await receiveViewOnce('secret');
+      final m = notifier.byId(convoId)!.messages.single;
+
+      expect(
+          await notifier.forwardMessage(
+              source: m, targetConversationId: convoId),
+          isFalse);
     });
   });
 

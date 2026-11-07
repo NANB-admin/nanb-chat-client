@@ -46,6 +46,8 @@ class ChatMessage {
     this.edited = false,
     this.deliveredAt,
     this.readAt,
+    this.viewOnce = false,
+    this.viewOnceOpenedAt,
   });
 
   final String envelopeId;
@@ -179,6 +181,13 @@ class ChatMessage {
   final DateTime? deliveredAt;
   final DateTime? readAt;
 
+  /// Sent "view once": the recipient can open it a single time.
+  final bool viewOnce;
+
+  /// When a view-once message was opened. On the recipient's devices its content
+  /// is gone from then on; on the sender's it is what shows "Opened".
+  final DateTime? viewOnceOpenedAt;
+
   ChatMessage copyWith({
     String? envelopeId,
     String? body,
@@ -205,6 +214,8 @@ class ChatMessage {
     bool? edited,
     DateTime? deliveredAt,
     DateTime? readAt,
+    DateTime? viewOnceOpenedAt,
+    bool clearMedia = false,
   }) {
     return ChatMessage(
       envelopeId: envelopeId ?? this.envelopeId,
@@ -216,13 +227,13 @@ class ChatMessage {
       outboxId: outboxId ?? this.outboxId,
       clientMsgId: clientMsgId ?? this.clientMsgId,
       kind: kind,
-      mediaId: mediaId ?? this.mediaId,
-      mediaKey: mediaKey ?? this.mediaKey,
-      mediaSha256: mediaSha256 ?? this.mediaSha256,
-      mediaSize: mediaSize ?? this.mediaSize,
+      mediaId: clearMedia ? null : (mediaId ?? this.mediaId),
+      mediaKey: clearMedia ? null : (mediaKey ?? this.mediaKey),
+      mediaSha256: clearMedia ? null : (mediaSha256 ?? this.mediaSha256),
+      mediaSize: clearMedia ? null : (mediaSize ?? this.mediaSize),
       mediaMime: mediaMime ?? this.mediaMime,
       mediaFilename: mediaFilename ?? this.mediaFilename,
-      voiceWaveform: voiceWaveform ?? this.voiceWaveform,
+      voiceWaveform: clearMedia ? null : (voiceWaveform ?? this.voiceWaveform),
       mediaDurationMs: mediaDurationMs ?? this.mediaDurationMs,
       replyToEnvelopeId: replyToEnvelopeId,
       replyToSender: replyToSender,
@@ -241,6 +252,8 @@ class ChatMessage {
       edited: edited ?? this.edited,
       deliveredAt: deliveredAt ?? this.deliveredAt,
       readAt: readAt ?? this.readAt,
+      viewOnce: viewOnce,
+      viewOnceOpenedAt: viewOnceOpenedAt ?? this.viewOnceOpenedAt,
     );
   }
 
@@ -278,7 +291,9 @@ class ChatMessage {
           linkPreview == other.linkPreview &&
           edited == other.edited &&
           deliveredAt == other.deliveredAt &&
-          readAt == other.readAt;
+          readAt == other.readAt &&
+          viewOnce == other.viewOnce &&
+          viewOnceOpenedAt == other.viewOnceOpenedAt;
 
   @override
   int get hashCode => Object.hash(
@@ -300,7 +315,8 @@ class ChatMessage {
         mediaDurationMs,
         // Combined into one slot — Object.hash caps at 20 positional args.
         Object.hash(replyToEnvelopeId, replyToSender, replyToPreview, forwarded,
-            clientMsgId, linkPreview, edited, deliveredAt, readAt),
+            clientMsgId, linkPreview, edited, deliveredAt, readAt, viewOnce,
+            viewOnceOpenedAt),
         failed,
         uploading,
         // Combined into one slot — Object.hash caps at 20 positional args.

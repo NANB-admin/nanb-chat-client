@@ -401,6 +401,52 @@ class MessageControl {
         syncKind = SyncControlKind.conversationDeleted,
         stateUpdate = null;
 
+  /// The sender is deleting their account: the recipient deletes the 1:1 with
+  /// them. Sent to every peer device; honored only from the chat's peer.
+  const MessageControl.accountDeleted()
+      : targetEnvelopeId = '',
+        receiptKind = null,
+        receiptIds = const [],
+        decision = null,
+        privacyScreenshots = null,
+        privacyForwarding = null,
+        isReestablish = false,
+        accessKey = const [],
+        reactionEmoji = null,
+        reactionRemove = false,
+        isPinControl = false,
+        pinRemove = false,
+        isScreenshotControl = false,
+        linkPreview = null,
+        editedText = null,
+        groupAvatarJson = null,
+        groupAvatarRemove = false,
+        syncKind = SyncControlKind.accountDeleted,
+        stateUpdate = null;
+
+  /// A view-once message was opened. [clientMsgId] is the sender's id for it,
+  /// the one id every device's copy shares.
+  const MessageControl.viewOnceOpened(String clientMsgId)
+      : targetEnvelopeId = clientMsgId,
+        receiptKind = null,
+        receiptIds = const [],
+        decision = null,
+        privacyScreenshots = null,
+        privacyForwarding = null,
+        isReestablish = false,
+        accessKey = const [],
+        reactionEmoji = null,
+        reactionRemove = false,
+        isPinControl = false,
+        pinRemove = false,
+        isScreenshotControl = false,
+        linkPreview = null,
+        editedText = null,
+        groupAvatarJson = null,
+        groupAvatarRemove = false,
+        syncKind = SyncControlKind.viewOnceOpened,
+        stateUpdate = null;
+
   /// Self-sync of per-chat state (mute, pin, archive, timer, block, verified,
   /// background, read position, clear watermark): a sparse map of changed
   /// fields, each with its own LWW version. Own devices only.
@@ -490,6 +536,8 @@ class MessageControl {
   bool get isConversationDeleted =>
       syncKind == SyncControlKind.conversationDeleted;
   bool get isDeleteForMe => syncKind == SyncControlKind.deleteForMe;
+  bool get isAccountDeleted => syncKind == SyncControlKind.accountDeleted;
+  bool get isViewOnceOpened => syncKind == SyncControlKind.viewOnceOpened;
   bool get isGroupDeleted => syncKind == SyncControlKind.groupDeleted;
   bool get isGroupAvatar => groupAvatarJson != null || groupAvatarRemove;
   bool get isEdit => editedText != null;
@@ -581,6 +629,12 @@ class MessageControl {
     }
     if (isConversationDeleted) {
       return jsonEncode({'_control': 'conversation_deleted'});
+    }
+    if (isAccountDeleted) {
+      return jsonEncode({'_control': 'account_deleted'});
+    }
+    if (isViewOnceOpened) {
+      return jsonEncode({'_control': 'view_once_opened', 'cid': targetEnvelopeId});
     }
     if (isConversationState) {
       return jsonEncode({
@@ -694,6 +748,12 @@ class MessageControl {
         return const MessageControl.groupDeleted();
       case 'conversation_deleted':
         return const MessageControl.conversationDeleted();
+      case 'account_deleted':
+        return const MessageControl.accountDeleted();
+      case 'view_once_opened':
+        final cid = raw['cid'];
+        if (cid is! String || cid.isEmpty) return null;
+        return MessageControl.viewOnceOpened(cid);
       case 'conversation_state':
         final fields = raw['fields'];
         if (fields is! Map) return null;

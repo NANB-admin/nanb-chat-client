@@ -644,7 +644,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('Delete Atlas?'), findsOneWidget);
-      expect(find.textContaining("You're still a member"), findsOneWidget);
+      expect(find.textContaining("You'll leave the group"), findsOneWidget);
     });
   });
 

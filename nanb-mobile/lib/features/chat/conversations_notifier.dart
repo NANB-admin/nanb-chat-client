@@ -41,6 +41,8 @@ import 'models/catchup_timing.dart';
 import 'models/chat_message.dart';
 import 'models/client_msg_id_header.dart';
 import 'models/conversation.dart';
+import 'models/view_once_content.dart';
+import 'models/view_once_header.dart';
 import 'models/control_migration_outcome.dart';
 import 'models/conversation_kind.dart';
 import 'models/crypto_mode.dart';
@@ -69,6 +71,8 @@ import 'services/envelope_retry_log.dart';
 import 'services/processed_envelope_log.dart';
 import 'services/disappearing_sweep.dart';
 import 'services/key_package_replenisher.dart';
+import 'services/account_deletion_notice.dart';
+import 'services/view_once_service.dart';
 import 'services/own_device_gap_finder.dart';
 import 'services/visible_payload.dart';
 import 'services/group_manager.dart';
@@ -1136,6 +1140,19 @@ class ConversationsNotifier extends ChangeNotifier
       // see the rest — several long "Catching up…" rounds for one backlog, with
       // everything past the first page simply absent in between. Now one run
       // drains until a short page (or nothing new) comes back.
+      //
+      // Each later page starts at the LAST envelope of the page before
+      // (`since` = its server_ts; the server's `>=` hands that one back again
+      // and [drainedIds] filters it). Re-asking from the head instead returned
+      // the SAME page whenever none of it got consumed: a full page of
+      // envelopes this device can never open then hid everything queued after
+      // it, for as long as they stayed unacked. Live 2026-11-07: an iPhone had
+      // 370 unacked, the oldest 200 from days earlier; every message that
+      // arrived while its app was closed sat behind them, so it only ever saw
+      // messages pushed while the app happened to be open. The cursor is local
+      // to this drain (the first page is always from the head), so it is not
+      // the time floor warned about above.
+      DateTime? pageCursor;
       var failedCount = 0;
       String firstError = '';
       var totalDrained = 0;
@@ -1157,7 +1174,7 @@ class ConversationsNotifier extends ChangeNotifier
           pending = null;
         } else {
           final fetchClock = Stopwatch()..start();
-          envs = await _fetchCatchupPage();
+          envs = await _fetchCatchupPage(since: pageCursor);
           fetchClock.stop();
           fetchMicros += fetchClock.elapsedMicroseconds;
         }
@@ -1203,6 +1220,7 @@ class ConversationsNotifier extends ChangeNotifier
                 print('catchup: skipping envelope ${env.envelopeId} '
                     '(${env.envelopeType}) — conversation ${env.conversationId} '
                     'wedged earlier in this drain');
+                await _countIfUnconsumed(env.envelopeId);
                 continue;
               }
               // Per-envelope isolation: one poisoned envelope must not abort the
@@ -1254,6 +1272,7 @@ class ConversationsNotifier extends ChangeNotifier
                   slowestType = env.envelopeType;
                 }
               }
+              await _countIfUnconsumed(env.envelopeId);
             }
           });
         } finally {
@@ -1261,35 +1280,13 @@ class ConversationsNotifier extends ChangeNotifier
           // a later live push for the same conversation notifies normally.
           _catchupEnvelopeIds.removeAll(fresh.map((e) => e.envelopeId));
         }
-        // BACKSTOP: whatever this page fetched but did NOT ack is coming back
-        // on the next drain. Several receive paths deliberately leave an
-        // envelope unacked so a later redelivery can succeed once state is
-        // repaired — correct while repair is still possible, an infinite loop
-        // when it never will be. Each of those sites had its own (or no) bound,
-        // so this counts the SYMPTOM at the one place it is observable —
-        // "fetched again and still not consumed" — and catches every path,
-        // including ones added later.
-        //
-        // Measured on-device 2026-08-22: 24 envelopes survived six launches
-        // under three separately-bounded paths, because they were taking a
-        // fourth. Whack-a-mole per drop site does not converge; this does.
-        final unconsumed = fresh
-            .map((e) => e.envelopeId)
-            .where((id) => !(_drainAckedIds?.contains(id) ?? false))
-            .toList(growable: false);
-        for (final id in unconsumed) {
-          if (await _retryLog.recordFailure(id) >= _maxUnconsumedRedeliveries) {
-            await _retryLog.forget(id);
-            // ignore: avoid_print
-            print('catchup: envelope $id fetched $_maxUnconsumedRedeliveries× '
-                'without ever being consumed; ack+dropping');
-            try {
-              await ack([id]);
-            } catch (_) {/* best-effort */}
-          }
-        }
         // A short page is the last page.
         if (envs.length < _catchupPageSize) break;
+        // Next page from the newest envelope on this one (see the paging
+        // comment above the loop).
+        pageCursor = envs
+            .map((e) => e.serverTs)
+            .reduce((a, b) => a.isAfter(b) ? a : b);
       }
       // Publish the drain's outcome. Set even when clean (to empty), so a
       // drain that recovers clears a stale banner.
@@ -1937,6 +1934,7 @@ class ConversationsNotifier extends ChangeNotifier
     required String myDeviceId,
     required String text,
     ChatMessage? replyTo,
+    bool viewOnce = false,
   }) async {
     // Defence in depth: the thread replaces the composer with an Unblock bar
     // when blocked, so this normally can't be reached — but never emit to a
@@ -1957,6 +1955,7 @@ class ConversationsNotifier extends ChangeNotifier
       kind: MessageKind.text,
       buildWireBody: () => text,
       replyRef: replyRef,
+      viewOnce: viewOnce,
     );
   }
 
@@ -2012,6 +2011,7 @@ class ConversationsNotifier extends ChangeNotifier
     // Only set for stickers: the `sticker.<ext>` marker that tells the receiving
     // client to render this image frameless. See [StickerMarker].
     String? filename,
+    bool viewOnce = false,
   }) async {
     final outboxId = await _insertOptimisticMessage(
       conversationId: conversationId,
@@ -2023,6 +2023,7 @@ class ConversationsNotifier extends ChangeNotifier
       mediaFilename: filename,
       mediaBytesForCache: imageBytes,
       forwarded: forwarded,
+      viewOnce: viewOnce,
     );
     _uploadWorker.enqueue(PendingUpload(
       outboxId: outboxId,
@@ -2049,6 +2050,7 @@ class ConversationsNotifier extends ChangeNotifier
     List<int>? waveform,
     int? durationMs,
     bool forwarded = false,
+    bool viewOnce = false,
   }) async {
     const mime = 'audio/mp4';
     final outboxId = await _insertOptimisticMessage(
@@ -2062,6 +2064,7 @@ class ConversationsNotifier extends ChangeNotifier
       mediaDurationMs: durationMs,
       mediaBytesForCache: voiceBytes,
       forwarded: forwarded,
+      viewOnce: viewOnce,
     );
     _uploadWorker.enqueue(PendingUpload(
       outboxId: outboxId,
@@ -2087,6 +2090,7 @@ class ConversationsNotifier extends ChangeNotifier
     required String mimeType,
     String caption = '',
     bool forwarded = false,
+    bool viewOnce = false,
   }) async {
     final outboxId = await _insertOptimisticMessage(
       conversationId: conversationId,
@@ -2097,6 +2101,7 @@ class ConversationsNotifier extends ChangeNotifier
       mediaMime: mimeType,
       mediaBytesForCache: videoBytes,
       forwarded: forwarded,
+      viewOnce: viewOnce,
     );
     _uploadWorker.enqueue(PendingUpload(
       outboxId: outboxId,
@@ -2391,6 +2396,8 @@ class ConversationsNotifier extends ChangeNotifier
     required ChatMessage source,
     required String targetConversationId,
   }) async {
+    // View once means seen once, by the person it was sent to.
+    if (source.viewOnce) return false;
     final session = await _sessions.current();
     if (session == null) return false;
     final myDeviceId = session.deviceId;
@@ -2585,7 +2592,7 @@ class ConversationsNotifier extends ChangeNotifier
   late final UploadWorker _uploadWorker = UploadWorker(host: this, media: _media, submitOutbox: _submitOutbox, markOutboxFailed: _markOutboxFailed);
   late final KeyPackageReplenisher _keyPackageReplenisher = KeyPackageReplenisher(api: _api, crypto: _crypto, storage: _secureStorage);
   late final DisappearingSweep _disappearingSweep = DisappearingSweep(host: this, mediaCache: _mediaCache, tempMediaStore: _tempMediaStore, ttlProvider: () => _ttlProvider?.call());
-  late final ControlReceiver _controlReceiver = ControlReceiver(host: this, receipts: _receiptService, requestDecisions: _requestDecisions, sealedSender: _sealedSender, reactions: _reactionService, pins: _pinService, groupAvatars: _groupAvatarService, linkPreviews: _linkPreviewService, edits: _messageEditService, deleteSync: _deleteSync, stateApplier: _stateApplier, conversationDeleteSync: _conversationDeleteSync, groupDisband: _groupDisband, deleteMessageLocal: deleteMessageLocal, appendSystemEvent: _appendSystemEventLocked);
+  late final ControlReceiver _controlReceiver = ControlReceiver(host: this, receipts: _receiptService, requestDecisions: _requestDecisions, sealedSender: _sealedSender, reactions: _reactionService, pins: _pinService, groupAvatars: _groupAvatarService, linkPreviews: _linkPreviewService, edits: _messageEditService, deleteSync: _deleteSync, stateApplier: _stateApplier, conversationDeleteSync: _conversationDeleteSync, accountDeletionNotice: _accountDeletionNotice, viewOnce: _viewOnce, groupDisband: _groupDisband, deleteMessageLocal: deleteMessageLocal, appendSystemEvent: _appendSystemEventLocked);
   late final MessageAppender _messageAppender = MessageAppender(onRebuildRequested: (env, device) => _mlsReceiver.onRebuildRequested(env, device), host: this, controlReceiver: _controlReceiver, controlSender: _controlSender, callSignalHandler: () => onCallSignal, applyGroupInfo: _applyGroupInfo, notifications: _localNotifications, appInForeground: () => appInForeground, activeConversationId: () => _openConversationId, isCatchupEnvelope: (id) => _catchupEnvelopeIds.contains(id));
   late final MlsReceiver _mlsReceiver = MlsReceiver(host: this, crypto: _crypto, api: _api, sessions: _sessions, deviceCache: _deviceCache, appender: _messageAppender, controlSender: _controlSender, appendUnknownPeerEnvelope: _appendUnknownPeerEnvelope, isUnknownPeerPlaceholder: _isUnknownPeerPlaceholder, recordPeerDisplayName: _recordPeerDisplayName, peerAccountFromOneToOneId: _peerAccountFromOneToOneId, retryLog: _retryLog, processedLog: _processedLog, onGroupChanged: (id) {
     _resender.onGroupChanged(id);
@@ -2641,6 +2648,90 @@ class ConversationsNotifier extends ChangeNotifier
               _controlSender.sendSelfControl(id, body, onSealed: onSealed),
           deleteConversation: (id) => deleteConversation(id));
   late final GroupDisbandService _groupDisband = GroupDisbandService(this);
+  late final AccountDeletionNotice _accountDeletionNotice =
+      AccountDeletionNotice(this);
+  late final ViewOnceService _viewOnce =
+      ViewOnceService(this, empty: _emptyViewOnce);
+
+  /// Envelope ids of view-once messages being opened right now, so a double tap
+  /// can't open one twice.
+  final Set<String> _viewOnceOpening = {};
+
+  /// Opens a view-once message the peer sent: returns what it showed, exactly
+  /// once, and empties it here and on our other devices. The sender's devices
+  /// are told it was opened. Null when it can't be opened (already opened, ours,
+  /// not view once, or its media couldn't be fetched).
+  Future<ViewOnceContent?> openViewOnce(
+      String conversationId, String envelopeId) async {
+    final live = _byId[conversationId];
+    final m = live?.messages.where((x) => x.envelopeId == envelopeId).firstOrNull;
+    if (m == null || m.mine || !m.viewOnce || m.viewOnceOpenedAt != null) {
+      return null;
+    }
+    if (!_viewOnceOpening.add(envelopeId)) return null;
+    try {
+      List<int>? bytes;
+      if (m.kind != MessageKind.text) {
+        try {
+          bytes = await mediaBytesFor(m);
+        } catch (_) {
+          return null; // Not opened: it can be tried again.
+        }
+        if (bytes == null) return null;
+      }
+      final content = ViewOnceContent(
+          kind: m.kind, text: m.body, bytes: bytes, mime: m.mediaMime);
+      await _emptyViewOnce(conversationId, m, DateTime.now().toUtc());
+      final body =
+          MessageControl.viewOnceOpened(ViewOnceService.sharedId(m)).encode();
+      unawaited(_controlSender
+          .sendControl(conversationId, body, allPeerDevices: true)
+          .catchError((Object e) => debugPrint('view once: peer not told: $e')));
+      unawaited(_controlSender
+          .sendSelfControl(conversationId, body)
+          .catchError((Object e) => debugPrint('view once: siblings not told: $e')));
+      return content;
+    } finally {
+      _viewOnceOpening.remove(envelopeId);
+    }
+  }
+
+  /// When our own copy of a sent message expires: the disappearing timer, and for
+  /// a view-once message no later than its unopened lifetime.
+  static DateTime? _ownCopyExpiry(
+      ChatMessage pending, DateTime serverTs, int? ttlSecs) {
+    final ttlExpiry = ttlSecs != null && ttlSecs > 0
+        ? serverTs.toUtc().add(Duration(seconds: ttlSecs))
+        : null;
+    return pending.viewOnce
+        ? ViewOnceHeader.expiry(serverTs, ttlExpiry)
+        : ttlExpiry;
+  }
+
+  /// Empties a view-once message: no text, no media key, nothing cached, and
+  /// marked opened. What's left only says it was a view-once message.
+  Future<void> _emptyViewOnce(
+      String conversationId, ChatMessage m, DateTime openedAt) async {
+    final live = _byId[conversationId];
+    if (live == null) return;
+    final emptied =
+        m.copyWith(body: '', clearMedia: true, viewOnceOpenedAt: openedAt);
+    _byId[conversationId] = live.copyWith(messages: [
+      for (final x in live.messages) x.envelopeId == m.envelopeId ? emptied : x,
+    ]);
+    await _db.upsertMessages(conversationId, [emptied]);
+    for (final id in {m.envelopeId, if (m.outboxId?.isNotEmpty ?? false) m.outboxId!}) {
+      _mediaCache.evict(id);
+      _mediaCache.evictThumbnail(id);
+      await _tempMediaStore.deleteForEnvelope(id);
+    }
+    notifyListeners();
+  }
+
+  /// Before deleting the account: tells every 1:1 peer, so their devices delete
+  /// the chat with this account. Returns how many chats couldn't be reached.
+  Future<int> notifyContactsOfAccountDeletion() =>
+      _accountDeletionNotice.notifyContacts();
   late final SealedSender _sealedSender = SealedSender(
     crypto: _crypto,
     api: _api,
@@ -3873,6 +3964,7 @@ class ConversationsNotifier extends ChangeNotifier
     String? replyToPreview,
     List<int>? mediaBytesForCache,
     bool forwarded = false,
+    bool viewOnce = false,
   }) async {
     if (!_byId.containsKey(conversationId)) {
       throw StateError('conversation $conversationId not found');
@@ -3909,6 +4001,7 @@ class ConversationsNotifier extends ChangeNotifier
       forwarded: forwarded,
       uploading: uploading,
       pendingUploadKey: pendingKey,
+      viewOnce: viewOnce,
     );
     // Re-read the convo AFTER the staging write — multiple concurrent
     // [_insertOptimisticMessage] calls each yield at the writeEncrypted
@@ -4643,6 +4736,7 @@ class ConversationsNotifier extends ChangeNotifier
             // A sent message keeps an EMPTY outbox id once the server has it;
             // only a non-empty one is still waiting to go out.
             (m.outboxId == null || m.outboxId!.isEmpty) &&
+            !m.viewOnce &&
             !m.failed &&
             !m.uploading &&
             m.kind != MessageKind.system)
@@ -4761,6 +4855,38 @@ class ConversationsNotifier extends ChangeNotifier
   Future<bool> _isMyDeviceWarm(String deviceId, String myDeviceId) =>
       _deviceCache.isMyDeviceWarm(deviceId, myDeviceId);
 
+  /// BACKSTOP for a drained envelope that was NOT acked: it is coming back on
+  /// the next drain. Several receive paths deliberately leave an envelope
+  /// unacked so a later redelivery can succeed once state is repaired —
+  /// correct while repair is still possible, an infinite loop when it never
+  /// will be. Each of those sites had its own (or no) bound, so this counts the
+  /// SYMPTOM at the one place it is observable — "fetched again and still not
+  /// consumed" — and catches every path, including ones added later.
+  ///
+  /// Measured on-device 2026-08-22: 24 envelopes survived six launches under
+  /// three separately-bounded paths, because they were taking a fourth.
+  /// Whack-a-mole per drop site does not converge; this does.
+  ///
+  /// Counted per envelope, right after it is handled, not once the whole page
+  /// is done: iOS suspends an app seconds after it leaves the screen, so a
+  /// drain over a long backlog is often cut off mid-page. Counting at the end
+  /// of the page meant such a drain recorded nothing, the same dead envelopes
+  /// came back every launch, and the bound never fired.
+  Future<void> _countIfUnconsumed(String envelopeId) async {
+    if (_drainAckedIds?.contains(envelopeId) ?? false) return;
+    if (await _retryLog.recordFailure(envelopeId) <
+        _maxUnconsumedRedeliveries) {
+      return;
+    }
+    await _retryLog.forget(envelopeId);
+    // ignore: avoid_print
+    print('catchup: envelope $envelopeId fetched $_maxUnconsumedRedeliveries× '
+        'without ever being consumed; ack+dropping');
+    try {
+      await ack([envelopeId]);
+    } catch (_) {/* best-effort */}
+  }
+
   /// Fetches one catchup page, preferring the already-open WebSocket.
   ///
   /// `POST /messages/catchup` runs right after connect, concurrently with the
@@ -4773,19 +4899,23 @@ class ConversationsNotifier extends ChangeNotifier
   /// Falls back to HTTP on ANY socket failure. A drain is a pure READ that
   /// consumes nothing, so — unlike a send — re-issuing it can never
   /// double-deliver; the worst case is exactly the old behaviour.
-  Future<List<wire.Envelope>> _fetchCatchupPage() async {
+  ///
+  /// [since] is this drain's page cursor (null for its first page): see the
+  /// paging comment in [_runCatchup].
+  Future<List<wire.Envelope>> _fetchCatchupPage({DateTime? since}) async {
     if (_ws.isConnected) {
       try {
         return await _ws.catchupOverSocket(
           'catchup-${_clientRefCounter++}',
           limit: _catchupPageSize,
+          since: since,
         );
       } catch (_) {
         // Not connected, refused, dropped or timed out — fall through to HTTP
         // rather than leave the backlog undrained.
       }
     }
-    return _api.catchupMessages(limit: _catchupPageSize);
+    return _api.catchupMessages(limit: _catchupPageSize, since: since);
   }
 
   /// Counts one failed sealed-OPEN for [envelopeId] and, once it has failed
@@ -5193,6 +5323,14 @@ class ConversationsNotifier extends ChangeNotifier
     if (liveConvoAtSend == null) return; // convo removed concurrently
     var wireBody = buildWireBody();
 
+    // View once sits just inside the privacy header (see ViewOnceHeader).
+    final outgoing = liveConvoAtSend.messages
+        .where((m) => m.outboxId == outboxId)
+        .firstOrNull;
+    if (outgoing?.viewOnce == true) {
+      wireBody = ViewOnceHeader.prefix + wireBody;
+    }
+
     // While either conversation-privacy flag is on, every outgoing 1:1
     // message carries the flags as the OUTERMOST header so the peer
     // converges statelessly (new conversations, re-installs, missed
@@ -5414,9 +5552,7 @@ class ConversationsNotifier extends ChangeNotifier
       clearPendingUploadKey: true,
       // Expire our own copy on the same timer the recipient got (the TTL
       // we just sent), anchored to the server's authoritative timestamp.
-      expiresAt: ttlSecs != null && ttlSecs > 0
-          ? result.serverTs.toUtc().add(Duration(seconds: ttlSecs))
-          : null,
+      expiresAt: _ownCopyExpiry(pending, result.serverTs, ttlSecs),
     );
     final live = _byId[conversationId];
     if (live != null) {
@@ -5594,6 +5730,7 @@ class ConversationsNotifier extends ChangeNotifier
     required String Function() buildWireBody,
     ReplyRef? replyRef,
     bool forwarded = false,
+    bool viewOnce = false,
   }) async {
     final outboxId = await _insertOptimisticMessage(
       conversationId: conversationId,
@@ -5605,6 +5742,7 @@ class ConversationsNotifier extends ChangeNotifier
       replyToSender: replyRef?.sender,
       replyToPreview: replyRef?.preview,
       forwarded: forwarded,
+      viewOnce: viewOnce,
     );
     return _submitOutbox(
       conversationId: conversationId,

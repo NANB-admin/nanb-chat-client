@@ -7,4 +7,13 @@
 ///   deletes it locally. Honored only from a roster admin (or their own device).
 /// - [conversationDeleted]: the user deleted a 1:1 on one device; their other
 ///   devices delete it too (own devices only, nothing goes to the peer).
-enum SyncControlKind { deleteForMe, groupDeleted, conversationDeleted }
+/// - [accountDeleted]: the peer is deleting their account; the chat with them
+///   is deleted. Honored only from the chat's peer, never an own device.
+/// - [viewOnceOpened]: a view-once message was opened; every copy is emptied.
+enum SyncControlKind {
+  deleteForMe,
+  groupDeleted,
+  conversationDeleted,
+  accountDeleted,
+  viewOnceOpened,
+}
